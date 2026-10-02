@@ -20,6 +20,11 @@ namespace Telegram.Services.HotReactions
         public string SenderName { get; set; } = string.Empty;
         public bool HasMedia { get; set; }
         public bool IsCold { get; set; }
+        public string ReactionsJson { get; set; }
+        public int DisplayScore { get; set; }
+        public string DisplayBadge { get; set; }
+        public string SubDetailText { get; set; }
+        public Windows.UI.Xaml.Visibility SubDetailVisibility => string.IsNullOrEmpty(SubDetailText) ? Windows.UI.Xaml.Visibility.Collapsed : Windows.UI.Xaml.Visibility.Visible;
         public Windows.UI.Xaml.Visibility MediaVisibility => HasMedia ? Windows.UI.Xaml.Visibility.Visible : Windows.UI.Xaml.Visibility.Collapsed;
 
         public string FormattedCount
@@ -38,7 +43,7 @@ namespace Telegram.Services.HotReactions
             }
         }
 
-        public string BadgeText => $"{TopEmoji} {FormattedCount}";
+        public string BadgeText => !string.IsNullOrEmpty(DisplayBadge) ? DisplayBadge : $"{TopEmoji} {FormattedCount}";
 
         public string FormattedDate
         {
@@ -79,6 +84,8 @@ namespace Telegram.Services.HotReactions
         public int ComputedThreshold { get; set; } = 1;
         public int? CustomThreshold { get; set; }
         public long LastHotSync { get; set; }
+        public long EarliestMsgId { get; set; }
+        public long EarliestMsgDate { get; set; }
 
         public int EffectiveThreshold => CustomThreshold ?? (ComputedThreshold > 0 ? ComputedThreshold : 1);
     }

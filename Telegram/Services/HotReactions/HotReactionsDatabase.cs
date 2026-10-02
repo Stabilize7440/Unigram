@@ -9,6 +9,7 @@ using SQLitePCL;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Telegram.Common;
 using Windows.Storage;
 
@@ -52,6 +53,27 @@ namespace Telegram.Services.HotReactions
 
                     CreateTables();
 
+                    try
+                    {
+                        ExecuteNonQuery("ALTER TABLE channel_hot_messages ADD COLUMN reactions_json TEXT;");
+                    }
+                    catch { }
+
+                    try
+                    {
+                        ExecuteNonQuery("ALTER TABLE channel_sync_state ADD COLUMN earliest_msg_id INTEGER DEFAULT 0;");
+                    }
+                    catch { }
+
+                    try
+                    {
+                        ExecuteNonQuery("ALTER TABLE channel_sync_state ADD COLUMN earliest_msg_date INTEGER DEFAULT 0;");
+                    }
+                    catch { }
+
+                    var configs = GetSentimentConfigs();
+                    ReactionSentimentService.Current.LoadCustomConfig(configs);
+
                     // 一次性修复：解除此前版本因单批消息数 < 100 误判造成的 cold_sync_completed = 1 封锁
                     ExecuteNonQuery("UPDATE channel_sync_state SET cold_sync_completed = 0 WHERE cold_sync_completed = 1;");
                 }
@@ -74,7 +96,9 @@ namespace Telegram.Services.HotReactions
                     sample_sum INTEGER DEFAULT 0,
                     computed_threshold INTEGER DEFAULT 1,
                     custom_threshold INTEGER DEFAULT NULL,
-                    last_hot_sync INTEGER DEFAULT 0
+                    last_hot_sync INTEGER DEFAULT 0,
+                    earliest_msg_id INTEGER DEFAULT 0,
+                    earliest_msg_date INTEGER DEFAULT 0
                 );
             ");
 
@@ -90,7 +114,15 @@ namespace Telegram.Services.HotReactions
                     has_media INTEGER,
                     is_cold INTEGER DEFAULT 0,
                     is_deleted INTEGER DEFAULT 0,
+                    reactions_json TEXT,
                     PRIMARY KEY (chat_id, message_id)
+                );
+            ");
+
+            ExecuteNonQuery(@"
+                CREATE TABLE IF NOT EXISTS reaction_sentiment_config (
+                    emoji TEXT PRIMARY KEY,
+                    category INTEGER
                 );
             ");
 
@@ -117,7 +149,8 @@ namespace Telegram.Services.HotReactions
                 const string sql = @"
                     SELECT chat_id, newest_synced_msg_id, oldest_synced_msg_id, 
                            cold_sync_completed, sample_count, sample_sum, 
-                           computed_threshold, custom_threshold, last_hot_sync
+                           computed_threshold, custom_threshold, last_hot_sync,
+                           earliest_msg_id, earliest_msg_date
                     FROM channel_sync_state WHERE chat_id = ?;
                 ";
 
@@ -143,7 +176,9 @@ namespace Telegram.Services.HotReactions
                             SampleSum = raw.sqlite3_column_int(stmt, 5),
                             ComputedThreshold = Math.Max(1, raw.sqlite3_column_int(stmt, 6)),
                             CustomThreshold = raw.sqlite3_column_type(stmt, 7) == raw.SQLITE_NULL ? null : raw.sqlite3_column_int(stmt, 7),
-                            LastHotSync = raw.sqlite3_column_int64(stmt, 8)
+                            LastHotSync = raw.sqlite3_column_int64(stmt, 8),
+                            EarliestMsgId = raw.sqlite3_column_int64(stmt, 9),
+                            EarliestMsgDate = raw.sqlite3_column_int64(stmt, 10)
                         };
                         return state;
                     }
@@ -177,8 +212,9 @@ namespace Telegram.Services.HotReactions
                     INSERT OR REPLACE INTO channel_sync_state (
                         chat_id, newest_synced_msg_id, oldest_synced_msg_id,
                         cold_sync_completed, sample_count, sample_sum,
-                        computed_threshold, custom_threshold, last_hot_sync
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        computed_threshold, custom_threshold, last_hot_sync,
+                        earliest_msg_id, earliest_msg_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 ";
 
                 sqlite3_stmt stmt = null;
@@ -207,6 +243,8 @@ namespace Telegram.Services.HotReactions
                     }
 
                     raw.sqlite3_bind_int64(stmt, 9, state.LastHotSync);
+                    raw.sqlite3_bind_int64(stmt, 10, state.EarliestMsgId);
+                    raw.sqlite3_bind_int64(stmt, 11, state.EarliestMsgDate);
 
                     raw.sqlite3_step(stmt);
                 }
@@ -238,8 +276,8 @@ namespace Telegram.Services.HotReactions
                 const string sql = @"
                     INSERT OR REPLACE INTO channel_hot_messages (
                         chat_id, message_id, date, max_reaction_count, top_emoji,
-                        snippet, sender_name, has_media, is_cold, is_deleted
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0);
+                        snippet, sender_name, has_media, is_cold, is_deleted, reactions_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);
                 ";
 
                 sqlite3_stmt stmt = null;
@@ -258,6 +296,7 @@ namespace Telegram.Services.HotReactions
                             raw.sqlite3_bind_text(stmt, 7, msg.SenderName ?? string.Empty);
                             raw.sqlite3_bind_int(stmt, 8, msg.HasMedia ? 1 : 0);
                             raw.sqlite3_bind_int(stmt, 9, msg.IsCold ? 1 : 0);
+                            raw.sqlite3_bind_text(stmt, 10, msg.ReactionsJson ?? string.Empty);
 
                             raw.sqlite3_step(stmt);
                             raw.sqlite3_reset(stmt);
@@ -359,7 +398,7 @@ namespace Telegram.Services.HotReactions
             }
         }
 
-        public List<HotMessageItem> GetTopMessages(long chatId, int limit = 100, long? minDate = null, int minReactions = 1)
+        public List<HotMessageItem> GetTopMessages(long chatId, int limit = 0, long? minDate = null, int minReactions = 1, HotRankMode mode = HotRankMode.All)
         {
             lock (_lock)
             {
@@ -369,15 +408,19 @@ namespace Telegram.Services.HotReactions
                     return list;
                 }
 
+                // limit <= 0 时不加 SQL LIMIT，全量查出满足门槛的所有消息；若有 limit 且为 All 模式，直接在 SQL 限制
+                bool hasLimit = limit > 0 && mode == HotRankMode.All;
+                string limitClause = hasLimit ? " LIMIT ?" : string.Empty;
+
                 var sql = minDate.HasValue
-                    ? @"SELECT chat_id, message_id, date, max_reaction_count, top_emoji, snippet, sender_name, has_media, is_cold
+                    ? $@"SELECT chat_id, message_id, date, max_reaction_count, top_emoji, snippet, sender_name, has_media, is_cold, reactions_json
                         FROM channel_hot_messages 
                         WHERE chat_id = ? AND is_deleted = 0 AND max_reaction_count >= ? AND date >= ?
-                        ORDER BY max_reaction_count DESC, date DESC LIMIT ?;"
-                    : @"SELECT chat_id, message_id, date, max_reaction_count, top_emoji, snippet, sender_name, has_media, is_cold
+                        ORDER BY max_reaction_count DESC, date DESC{limitClause};"
+                    : $@"SELECT chat_id, message_id, date, max_reaction_count, top_emoji, snippet, sender_name, has_media, is_cold, reactions_json
                         FROM channel_hot_messages 
                         WHERE chat_id = ? AND is_deleted = 0 AND max_reaction_count >= ?
-                        ORDER BY max_reaction_count DESC, date DESC LIMIT ?;";
+                        ORDER BY max_reaction_count DESC, date DESC{limitClause};";
 
                 sqlite3_stmt stmt = null;
                 try
@@ -387,14 +430,14 @@ namespace Telegram.Services.HotReactions
                         raw.sqlite3_bind_int64(stmt, 1, chatId);
                         raw.sqlite3_bind_int(stmt, 2, minReactions);
 
+                        int paramIdx = 3;
                         if (minDate.HasValue)
                         {
-                            raw.sqlite3_bind_int64(stmt, 3, minDate.Value);
-                            raw.sqlite3_bind_int(stmt, 4, limit);
+                            raw.sqlite3_bind_int64(stmt, paramIdx++, minDate.Value);
                         }
-                        else
+                        if (hasLimit)
                         {
-                            raw.sqlite3_bind_int(stmt, 3, limit);
+                            raw.sqlite3_bind_int(stmt, paramIdx++, limit);
                         }
 
                         while (raw.sqlite3_step(stmt) == raw.SQLITE_ROW)
@@ -409,7 +452,8 @@ namespace Telegram.Services.HotReactions
                                 Snippet = raw.sqlite3_column_text(stmt, 5).utf8_to_string(),
                                 SenderName = raw.sqlite3_column_text(stmt, 6).utf8_to_string(),
                                 HasMedia = raw.sqlite3_column_int(stmt, 7) != 0,
-                                IsCold = raw.sqlite3_column_int(stmt, 8) != 0
+                                IsCold = raw.sqlite3_column_int(stmt, 8) != 0,
+                                ReactionsJson = raw.sqlite3_column_type(stmt, 9) == raw.SQLITE_NULL ? null : raw.sqlite3_column_text(stmt, 9).utf8_to_string()
                             });
                         }
                     }
@@ -426,7 +470,133 @@ namespace Telegram.Services.HotReactions
                     }
                 }
 
-                return list;
+                if (mode == HotRankMode.All)
+                {
+                    foreach (var item in list)
+                    {
+                        var (score, badge, sub) = ReactionSentimentService.Current.EvaluateMessage(item, mode);
+                        item.DisplayScore = score;
+                        item.DisplayBadge = badge;
+                        item.SubDetailText = sub;
+                    }
+                    return limit > 0 ? list.Take(limit).ToList() : list;
+                }
+
+                var evaluated = new List<HotMessageItem>();
+                foreach (var item in list)
+                {
+                    var (score, badge, sub) = ReactionSentimentService.Current.EvaluateMessage(item, mode);
+                    if (score >= minReactions && score > 0)
+                    {
+                        item.DisplayScore = score;
+                        item.DisplayBadge = badge;
+                        item.SubDetailText = sub;
+                        evaluated.Add(item);
+                    }
+                }
+
+                var ordered = evaluated
+                    .OrderByDescending(x => x.DisplayScore)
+                    .ThenByDescending(x => x.Date);
+
+                return limit > 0 ? ordered.Take(limit).ToList() : ordered.ToList();
+            }
+        }
+
+        public Dictionary<string, SentimentCategory> GetSentimentConfigs()
+        {
+            lock (_lock)
+            {
+                var dict = new Dictionary<string, SentimentCategory>(StringComparer.Ordinal);
+                if (_db == null) return dict;
+
+                const string sql = "SELECT emoji, category FROM reaction_sentiment_config;";
+                sqlite3_stmt stmt = null;
+                try
+                {
+                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
+                    {
+                        while (raw.sqlite3_step(stmt) == raw.SQLITE_ROW)
+                        {
+                            var emoji = raw.sqlite3_column_text(stmt, 0).utf8_to_string();
+                            var cat = (SentimentCategory)raw.sqlite3_column_int(stmt, 1);
+                            if (!string.IsNullOrEmpty(emoji))
+                            {
+                                dict[emoji] = cat;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Exception(ex);
+                }
+                finally
+                {
+                    if (stmt != null) raw.sqlite3_finalize(stmt);
+                }
+                return dict;
+            }
+        }
+
+        public void SaveSentimentConfig(string emoji, SentimentCategory? category)
+        {
+            lock (_lock)
+            {
+                if (_db == null || string.IsNullOrEmpty(emoji)) return;
+
+                if (category.HasValue)
+                {
+                    const string sql = "INSERT OR REPLACE INTO reaction_sentiment_config (emoji, category) VALUES (?, ?);";
+                    sqlite3_stmt stmt = null;
+                    try
+                    {
+                        if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
+                        {
+                            raw.sqlite3_bind_text(stmt, 1, emoji);
+                            raw.sqlite3_bind_int(stmt, 2, (int)category.Value);
+                            raw.sqlite3_step(stmt);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Exception(ex);
+                    }
+                    finally
+                    {
+                        if (stmt != null) raw.sqlite3_finalize(stmt);
+                    }
+                }
+                else
+                {
+                    const string sql = "DELETE FROM reaction_sentiment_config WHERE emoji = ?;";
+                    sqlite3_stmt stmt = null;
+                    try
+                    {
+                        if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
+                        {
+                            raw.sqlite3_bind_text(stmt, 1, emoji);
+                            raw.sqlite3_step(stmt);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Exception(ex);
+                    }
+                    finally
+                    {
+                        if (stmt != null) raw.sqlite3_finalize(stmt);
+                    }
+                }
+            }
+        }
+
+        public void ClearSentimentConfigs()
+        {
+            lock (_lock)
+            {
+                if (_db == null) return;
+                ExecuteNonQuery("DELETE FROM reaction_sentiment_config;");
             }
         }
 

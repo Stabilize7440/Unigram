@@ -1803,6 +1803,7 @@
     <Compile Include="Services\HotReactions\HotMessageItem.cs" />
     <Compile Include="Services\HotReactions\HotReactionsDatabase.cs" />
     <Compile Include="Services\HotReactions\HotReactionsService.cs" />
+    <Compile Include="Services\HotReactions\ReactionSentimentService.cs" />
     <Compile Include="Services\LifetimeService.cs" />
     <Compile Include="Services\LocaleService.cs" />
     <Compile Include="Services\LocationService.cs" />

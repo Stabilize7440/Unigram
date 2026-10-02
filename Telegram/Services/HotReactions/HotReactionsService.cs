@@ -32,33 +32,78 @@ namespace Telegram.Services.HotReactions
             _database.Initialize();
         }
 
-        public static (int Count, string Emoji) GetTopReaction(MessageInteractionInfo info)
+        public static (int TopCount, string TopEmoji, string ReactionsJson) ExtractReactions(MessageInteractionInfo info)
         {
             if (info?.Reactions?.Reactions == null || info.Reactions.Reactions.Count == 0)
             {
-                return (0, null);
+                return (0, null, null);
             }
 
-            var top = info.Reactions.Reactions
-                .OrderByDescending(x => x.TotalCount)
-                .FirstOrDefault();
+            var dict = new Dictionary<string, int>();
+            int maxCount = 0;
+            string topEmoji = "👍";
 
-            if (top == null || top.TotalCount <= 0)
+            foreach (var r in info.Reactions.Reactions)
             {
-                return (0, null);
+                if (r == null || r.TotalCount <= 0) continue;
+
+                string emoji = "👍";
+                if (r.Type is ReactionTypeEmoji emojiType)
+                {
+                    emoji = emojiType.Emoji;
+                }
+                else if (r.Type is ReactionTypeCustomEmoji)
+                {
+                    emoji = "⭐";
+                }
+
+                if (dict.TryGetValue(emoji, out int current))
+                {
+                    dict[emoji] = current + r.TotalCount;
+                }
+                else
+                {
+                    dict[emoji] = r.TotalCount;
+                }
+
+                if (dict[emoji] > maxCount)
+                {
+                    maxCount = dict[emoji];
+                    topEmoji = emoji;
+                }
             }
 
-            string emoji = "👍";
-            if (top.Type is ReactionTypeEmoji emojiType)
+            if (maxCount <= 0)
             {
-                emoji = emojiType.Emoji;
-            }
-            else if (top.Type is ReactionTypeCustomEmoji)
-            {
-                emoji = "⭐";
+                return (0, null, null);
             }
 
-            return (top.TotalCount, emoji);
+            string json = System.Text.Json.JsonSerializer.Serialize(dict);
+            return (maxCount, topEmoji, json);
+        }
+
+        public static (int Count, string Emoji) GetTopReaction(MessageInteractionInfo info)
+        {
+            var (count, emoji, _) = ExtractReactions(info);
+            return (count, emoji);
+        }
+
+        public async Task<(long MsgId, long Date)> GetEarliestMessageAsync(IClientService clientService, long chatId)
+        {
+            try
+            {
+                var response = await clientService.SendAsync(new GetChatHistory(chatId, 1, -1, 1, false));
+                if (response is Messages messages && messages.MessagesValue.Count > 0)
+                {
+                    var firstMsg = messages.MessagesValue[0];
+                    return (firstMsg.Id, firstMsg.Date);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Exception(ex);
+            }
+            return (0, 0);
         }
 
         public async Task<List<HotMessageItem>> SyncHotWindowAsync(IClientService clientService, long chatId, Action<string> progressCallback = null)
@@ -92,7 +137,7 @@ namespace Telegram.Services.HotReactions
                         reachedEnd = true;
                     }
 
-                    var (count, emoji) = GetTopReaction(msg.InteractionInfo);
+                    var (count, emoji, reactionsJson) = ExtractReactions(msg.InteractionInfo);
                     if (count > 0 && state.SampleCount < 50)
                     {
                         state.SampleCount++;
@@ -114,6 +159,7 @@ namespace Telegram.Services.HotReactions
                             Date = msg.Date,
                             MaxReactionCount = count,
                             TopEmoji = emoji,
+                            ReactionsJson = reactionsJson,
                             Snippet = snippet,
                             SenderName = GetSenderDisplayName(clientService, msg.SenderId),
                             HasMedia = hasMedia,
@@ -160,7 +206,6 @@ namespace Telegram.Services.HotReactions
                 try
                 {
                     cts.Cancel();
-                    cts.Dispose();
                 }
                 catch { }
             }
@@ -192,10 +237,23 @@ namespace Telegram.Services.HotReactions
                 var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                 var sevenDaysAgo = now - (7 * 86400);
                 int consecutiveErrors = 0;
-                int emptyBatchCount = 0;
+                int stallCount = 0;
 
                 try
                 {
+                    // 探针获取频道的最初消息时间与 ID，辅助裁定慢爬是否真正到达历史原点
+                    var initState = _database.GetSyncState(chatId);
+                    if (initState.EarliestMsgDate == 0)
+                    {
+                        var (earliestId, earliestDate) = await GetEarliestMessageAsync(clientService, chatId);
+                        if (earliestDate > 0)
+                        {
+                            initState.EarliestMsgId = earliestId;
+                            initState.EarliestMsgDate = earliestDate;
+                            _database.SaveSyncState(initState);
+                        }
+                    }
+
                     while (!token.IsCancellationRequested)
                     {
                         var currentState = _database.GetSyncState(chatId);
@@ -207,6 +265,11 @@ namespace Telegram.Services.HotReactions
 
                         long fromId = currentState.OldestSyncedMsgId;
                         var response = await clientService.SendAsync(new GetChatHistory(chatId, fromId, 0, 100, false));
+
+                        if (token.IsCancellationRequested)
+                        {
+                            break;
+                        }
 
                         if (response is Telegram.Td.Api.Error error)
                         {
@@ -236,31 +299,38 @@ namespace Telegram.Services.HotReactions
 
                         consecutiveErrors = 0;
 
+                        // 检查是否返回空批次
                         if (response is not Messages messages || messages.MessagesValue.Count == 0)
                         {
-                            emptyBatchCount++;
-                            // 防抖：连续两次返回 0 条且非起点，确认真正到达历史开端
-                            if (emptyBatchCount < 2 && fromId != 0)
+                            // 如果还未确认到达历史起点，说明 TDLib 正在远端加载数据，进行等待重试
+                            if (stallCount < 4)
                             {
-                                await Task.Delay(1500, token);
+                                stallCount++;
+                                onProgress?.Invoke($"正在同步历史深处数据 (重试 {stallCount}/4)...", true);
+                                await Task.Delay(2000, token);
                                 continue;
                             }
 
-                            currentState.ColdSyncCompleted = true;
-
-                            if (currentState.SampleCount > 0 && currentState.SampleCount < 50)
+                            // 连续重试 4 次依然为空，若确认已在起点附近，则标记完成；否则暂停待续
+                            if (fromId == 0 || (currentState.EarliestMsgId > 0 && fromId <= currentState.EarliestMsgId))
                             {
-                                double avg = (double)currentState.SampleSum / currentState.SampleCount;
-                                currentState.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
-                                _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
+                                currentState.ColdSyncCompleted = true;
+                                if (currentState.SampleCount > 0 && currentState.SampleCount < 50)
+                                {
+                                    double avg = (double)currentState.SampleSum / currentState.SampleCount;
+                                    currentState.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
+                                    _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
+                                }
+                                _database.SaveSyncState(currentState);
+                                onProgress?.Invoke("历史消息已全部扫描完毕", false);
                             }
-
-                            _database.SaveSyncState(currentState);
-                            onProgress?.Invoke("历史消息已全部扫描完毕", false);
+                            else
+                            {
+                                onProgress?.Invoke("历史数据同步停滞，可稍后点击继续", false);
+                            }
                             break;
                         }
 
-                        emptyBatchCount = 0;
                         var coldItems = new List<HotMessageItem>();
                         long oldestInBatch = fromId;
                         long oldestDateInBatch = 0;
@@ -270,7 +340,7 @@ namespace Telegram.Services.HotReactions
                             oldestInBatch = msg.Id;
                             oldestDateInBatch = msg.Date;
 
-                            var (count, emoji) = GetTopReaction(msg.InteractionInfo);
+                            var (count, emoji, reactionsJson) = ExtractReactions(msg.InteractionInfo);
                             if (count > 0 && currentState.SampleCount < 50)
                             {
                                 currentState.SampleCount++;
@@ -293,6 +363,7 @@ namespace Telegram.Services.HotReactions
                                     Date = msg.Date,
                                     MaxReactionCount = count,
                                     TopEmoji = emoji,
+                                    ReactionsJson = reactionsJson,
                                     Snippet = snippet,
                                     SenderName = GetSenderDisplayName(clientService, msg.SenderId),
                                     HasMedia = hasMedia,
@@ -306,8 +377,38 @@ namespace Telegram.Services.HotReactions
                             _database.UpsertMessages(chatId, coldItems);
                         }
 
-                        // 防死循环：若 ID 未推进，说明到达顶端或无更多
+                        bool reachedStart = (currentState.EarliestMsgId > 0 && oldestInBatch <= currentState.EarliestMsgId) ||
+                                            (currentState.EarliestMsgDate > 0 && oldestDateInBatch > 0 && oldestDateInBatch <= currentState.EarliestMsgDate);
+
+                        // 若 ID 未推进
                         if (oldestInBatch == fromId && fromId != 0)
+                        {
+                            if (reachedStart)
+                            {
+                                currentState.ColdSyncCompleted = true;
+                                _database.SaveSyncState(currentState);
+                                onProgress?.Invoke("历史消息已全部扫描完毕", false);
+                                break;
+                            }
+
+                            // 未到起点却未推进：TDLib 本地未命中，正在向云端拉取，等待重试
+                            stallCount++;
+                            if (stallCount < 4)
+                            {
+                                onProgress?.Invoke($"历史深度数据拉取中 (重试 {stallCount}/4)...", true);
+                                await Task.Delay(2000, token);
+                                continue;
+                            }
+
+                            onProgress?.Invoke("历史数据拉取暂无进展，可稍后点击继续", false);
+                            break;
+                        }
+
+                        // 正常推进
+                        stallCount = 0;
+                        currentState.OldestSyncedMsgId = oldestInBatch;
+
+                        if (reachedStart)
                         {
                             currentState.ColdSyncCompleted = true;
                             _database.SaveSyncState(currentState);
@@ -315,17 +416,37 @@ namespace Telegram.Services.HotReactions
                             break;
                         }
 
-                        currentState.OldestSyncedMsgId = oldestInBatch;
                         _database.SaveSyncState(currentState);
+
+                        if (token.IsCancellationRequested)
+                        {
+                            break;
+                        }
 
                         int totalSaved = _database.GetTotalHotCount(chatId);
                         string dateStr = oldestDateInBatch > 0
                             ? DateTimeOffset.FromUnixTimeSeconds(oldestDateInBatch).ToLocalTime().ToString("yyyy/MM/dd")
                             : string.Empty;
 
-                        onProgress?.Invoke($"慢爬中：已扫描至 {dateStr} (已收录 {totalSaved} 条)", true);
+                        if (currentState.EarliestMsgDate > 0 && oldestDateInBatch > 0 && now > currentState.EarliestMsgDate)
+                        {
+                            long totalSpan = Math.Max(1, now - currentState.EarliestMsgDate);
+                            long scannedSpan = Math.Max(0, now - oldestDateInBatch);
+                            int pct = (int)Math.Clamp((scannedSpan * 100) / totalSpan, 0, 99);
+                            string firstDateStr = DateTimeOffset.FromUnixTimeSeconds(currentState.EarliestMsgDate).ToLocalTime().ToString("yyyy/MM/dd");
+                            onProgress?.Invoke($"慢爬中：已扫描至 {dateStr} (起点: {firstDateStr} · 约 {pct}%) · 已收录 {totalSaved} 条", true);
+                        }
+                        else
+                        {
+                            onProgress?.Invoke($"慢爬中：已扫描至 {dateStr} (已收录 {totalSaved} 条)", true);
+                        }
 
                         await Task.Delay(2500, token);
+                    }
+
+                    if (token.IsCancellationRequested)
+                    {
+                        onProgress?.Invoke("慢爬已暂停", false);
                     }
                 }
                 catch (OperationCanceledException)
@@ -339,7 +460,15 @@ namespace Telegram.Services.HotReactions
                 }
                 finally
                 {
-                    _crawlers.TryRemove(chatId, out _);
+                    if (_crawlers.TryGetValue(chatId, out var existingCts) && existingCts == cts)
+                    {
+                        _crawlers.TryRemove(chatId, out _);
+                    }
+                    try
+                    {
+                        cts.Dispose();
+                    }
+                    catch { }
                 }
             }, cts.Token);
         }
@@ -362,7 +491,7 @@ namespace Telegram.Services.HotReactions
 
         public void UpdateMessageReaction(long chatId, long messageId, MessageInteractionInfo interactionInfo)
         {
-            var (count, emoji) = GetTopReaction(interactionInfo);
+            var (count, emoji, reactionsJson) = ExtractReactions(interactionInfo);
             var state = _database.GetSyncState(chatId);
 
             if (count >= state.EffectiveThreshold)
@@ -372,6 +501,7 @@ namespace Telegram.Services.HotReactions
                 {
                     existing.MaxReactionCount = count;
                     existing.TopEmoji = emoji;
+                    existing.ReactionsJson = reactionsJson;
                     _database.UpsertMessages(chatId, new[] { existing });
                 }
             }

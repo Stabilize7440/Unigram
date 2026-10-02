@@ -27,6 +27,12 @@ namespace Telegram.Views.Popups
         private readonly long _chatId;
 
         private bool _isWeekOnly = true;
+        private bool _userPausedCrawler = false;
+        private HotRankMode _rankMode = HotRankMode.NetPositive;
+
+        private int _currentPage = 1;
+        private const int PageSize = 40;
+        private List<HotMessageItem> _allCurrentItems = new List<HotMessageItem>();
 
         public HotReactionsPopup(IClientService clientService, INavigationService navigationService, long chatId)
         {
@@ -42,10 +48,14 @@ namespace Telegram.Views.Popups
         private async void OnPopupLoaded(object sender, RoutedEventArgs e)
         {
             UpdateFilterButtons();
+            UpdateRankModeButtons();
             await RefreshDataAsync();
 
-            // 启动冷区后台慢爬
-            HotReactionsService.Current.StartColdCrawler(_clientService, _chatId, OnCrawlerProgress);
+            // 仅在用户未主动暂停且当前没有爬虫在跑时，才启动冷区后台慢爬
+            if (!_userPausedCrawler && !HotReactionsService.Current.IsCrawlerRunning(_chatId))
+            {
+                HotReactionsService.Current.StartColdCrawler(_clientService, _chatId, OnCrawlerProgress);
+            }
         }
 
         private void OnPopupUnloaded(object sender, RoutedEventArgs e)
@@ -70,7 +80,7 @@ namespace Telegram.Views.Popups
                 });
 
                 UpdateThresholdUI();
-                ReloadList();
+                ReloadList(resetPage: true);
             }
             catch (Exception ex)
             {
@@ -106,15 +116,154 @@ namespace Telegram.Views.Popups
             }
         }
 
-        private void ReloadList()
+        private void ReloadList(bool resetPage = false)
         {
+            if (resetPage)
+            {
+                _currentPage = 1;
+            }
+
             var state = HotReactionsService.Current.Database.GetSyncState(_chatId);
             long? minDate = _isWeekOnly ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (7 * 86400) : null;
 
-            var items = HotReactionsService.Current.Database.GetTopMessages(_chatId, 100, minDate, state.EffectiveThreshold);
-            MessagesList.ItemsSource = items;
+            // limit = 0 取出满足门槛的所有高赞条目，进行全局排序与情绪打分
+            _allCurrentItems = HotReactionsService.Current.Database.GetTopMessages(_chatId, 0, minDate, state.EffectiveThreshold, _rankMode);
 
-            EmptyNotice.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            int totalCount = _allCurrentItems.Count;
+            int totalPages = Math.Max(1, (int)Math.Ceiling((double)totalCount / PageSize));
+
+            if (_currentPage > totalPages)
+            {
+                _currentPage = totalPages;
+            }
+            if (_currentPage < 1)
+            {
+                _currentPage = 1;
+            }
+
+            var pageItems = _allCurrentItems.Skip((_currentPage - 1) * PageSize).Take(PageSize).ToList();
+            MessagesList.ItemsSource = pageItems;
+
+            EmptyNotice.Visibility = totalCount == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+            // 更新分页条显示
+            PaginationSummaryText.Text = $"共 {totalCount} 条热门神帖";
+            PageNumText.Text = totalCount > 0 ? $"{_currentPage} / {totalPages}" : "0 / 0";
+            PrevPageBtn.IsEnabled = _currentPage > 1;
+            NextPageBtn.IsEnabled = _currentPage < totalPages;
+        }
+
+        private void PrevPage_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentPage > 1)
+            {
+                _currentPage--;
+                ReloadList(resetPage: false);
+                ScrollListToTop();
+            }
+        }
+
+        private void NextPage_Click(object sender, RoutedEventArgs e)
+        {
+            int totalPages = Math.Max(1, (int)Math.Ceiling((double)_allCurrentItems.Count / PageSize));
+            if (_currentPage < totalPages)
+            {
+                _currentPage++;
+                ReloadList(resetPage: false);
+                ScrollListToTop();
+            }
+        }
+
+        private void ScrollListToTop()
+        {
+            if (MessagesList.Items.Count > 0)
+            {
+                MessagesList.ScrollIntoView(MessagesList.Items[0]);
+            }
+        }
+
+        private void UpdateRankModeButtons()
+        {
+            RankNetPosBtn.FontWeight = _rankMode == HotRankMode.NetPositive ? Windows.UI.Text.FontWeights.Bold : Windows.UI.Text.FontWeights.Normal;
+            RankPosBtn.FontWeight = _rankMode == HotRankMode.Positive ? Windows.UI.Text.FontWeights.Bold : Windows.UI.Text.FontWeights.Normal;
+            RankNegBtn.FontWeight = _rankMode == HotRankMode.Negative ? Windows.UI.Text.FontWeights.Bold : Windows.UI.Text.FontWeights.Normal;
+            RankShockBtn.FontWeight = _rankMode == HotRankMode.Shock ? Windows.UI.Text.FontWeights.Bold : Windows.UI.Text.FontWeights.Normal;
+            RankAllBtn.FontWeight = _rankMode == HotRankMode.All ? Windows.UI.Text.FontWeights.Bold : Windows.UI.Text.FontWeights.Normal;
+        }
+
+        private void RankNetPos_Click(object sender, RoutedEventArgs e)
+        {
+            if (_rankMode != HotRankMode.NetPositive)
+            {
+                _rankMode = HotRankMode.NetPositive;
+                UpdateRankModeButtons();
+                ReloadList(resetPage: true);
+            }
+        }
+
+        private void RankPos_Click(object sender, RoutedEventArgs e)
+        {
+            if (_rankMode != HotRankMode.Positive)
+            {
+                _rankMode = HotRankMode.Positive;
+                UpdateRankModeButtons();
+                ReloadList(resetPage: true);
+            }
+        }
+
+        private void RankNeg_Click(object sender, RoutedEventArgs e)
+        {
+            if (_rankMode != HotRankMode.Negative)
+            {
+                _rankMode = HotRankMode.Negative;
+                UpdateRankModeButtons();
+                ReloadList(resetPage: true);
+            }
+        }
+
+        private void RankShock_Click(object sender, RoutedEventArgs e)
+        {
+            if (_rankMode != HotRankMode.Shock)
+            {
+                _rankMode = HotRankMode.Shock;
+                UpdateRankModeButtons();
+                ReloadList(resetPage: true);
+            }
+        }
+
+        private void RankAll_Click(object sender, RoutedEventArgs e)
+        {
+            if (_rankMode != HotRankMode.All)
+            {
+                _rankMode = HotRankMode.All;
+                UpdateRankModeButtons();
+                ReloadList(resetPage: true);
+            }
+        }
+
+        private void SaveConfigEmoji_Click(object sender, RoutedEventArgs e)
+        {
+            var emoji = ConfigEmojiInput.Text?.Trim();
+            if (string.IsNullOrEmpty(emoji)) return;
+
+            int catIndex = ConfigCategorySelect.SelectedIndex;
+            if (catIndex >= 0 && catIndex <= 2)
+            {
+                var category = (SentimentCategory)catIndex;
+                ReactionSentimentService.Current.SetCustomCategory(emoji, category);
+                HotReactionsService.Current.Database.SaveSentimentConfig(emoji, category);
+
+                ConfigEmojiInput.Text = string.Empty;
+                ReloadList(resetPage: false);
+            }
+        }
+
+        private void ResetConfigEmoji_Click(object sender, RoutedEventArgs e)
+        {
+            ReactionSentimentService.Current.ResetToDefaults();
+            HotReactionsService.Current.Database.ClearSentimentConfigs();
+            ConfigEmojiInput.Text = string.Empty;
+            ReloadList(resetPage: false);
         }
 
         private void UpdateFilterButtons()
@@ -129,7 +278,7 @@ namespace Telegram.Views.Popups
             {
                 _isWeekOnly = true;
                 UpdateFilterButtons();
-                ReloadList();
+                ReloadList(resetPage: true);
             }
         }
 
@@ -139,9 +288,9 @@ namespace Telegram.Views.Popups
             {
                 _isWeekOnly = false;
                 UpdateFilterButtons();
-                ReloadList();
+                ReloadList(resetPage: true);
 
-                if (!HotReactionsService.Current.IsCrawlerRunning(_chatId))
+                if (!_userPausedCrawler && !HotReactionsService.Current.IsCrawlerRunning(_chatId))
                 {
                     HotReactionsService.Current.StartColdCrawler(_clientService, _chatId, OnCrawlerProgress);
                 }
@@ -162,7 +311,7 @@ namespace Telegram.Views.Popups
             }
 
             UpdateThresholdUI();
-            ReloadList();
+            ReloadList(resetPage: true);
         }
 
         private async void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -172,24 +321,31 @@ namespace Telegram.Views.Popups
 
         private async void ResetAndRescan_Click(object sender, RoutedEventArgs e)
         {
+            _userPausedCrawler = false;
             HotReactionsService.Current.ResetChannelSync(_chatId);
             CrawlerStatusText.Text = "已重置频道历史索引，重新全量扫描...";
             UpdateThresholdUI();
-            ReloadList();
+            ReloadList(resetPage: true);
             await RefreshDataAsync();
-            HotReactionsService.Current.StartColdCrawler(_clientService, _chatId, OnCrawlerProgress, forceResume: true);
+            if (!_userPausedCrawler)
+            {
+                HotReactionsService.Current.StartColdCrawler(_clientService, _chatId, OnCrawlerProgress, forceResume: true);
+            }
         }
 
         private void CrawlerToggle_Click(object sender, RoutedEventArgs e)
         {
-            if (HotReactionsService.Current.IsCrawlerRunning(_chatId))
+            bool isRunning = HotReactionsService.Current.IsCrawlerRunning(_chatId);
+            if (isRunning)
             {
+                _userPausedCrawler = true;
                 HotReactionsService.Current.StopColdCrawler(_chatId);
                 CrawlerToggleBtn.Content = "继续慢爬";
                 CrawlerStatusText.Text = "慢爬已暂停";
             }
             else
             {
+                _userPausedCrawler = false;
                 HotReactionsService.Current.StartColdCrawler(_clientService, _chatId, OnCrawlerProgress, forceResume: true);
                 CrawlerToggleBtn.Content = "暂停慢爬";
                 CrawlerStatusText.Text = "慢爬已启动...";
@@ -200,11 +356,17 @@ namespace Telegram.Views.Popups
         {
             var ignored = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
+                if (_userPausedCrawler && isRunning)
+                {
+                    // 若用户已手动暂停，丢弃滞后的运行态通知，防止覆写 UI 状态
+                    return;
+                }
+
                 CrawlerStatusText.Text = status;
                 CrawlerToggleBtn.Content = isRunning ? "暂停慢爬" : "继续慢爬";
 
                 UpdateThresholdUI();
-                ReloadList();
+                ReloadList(resetPage: false);
             });
         }
 
