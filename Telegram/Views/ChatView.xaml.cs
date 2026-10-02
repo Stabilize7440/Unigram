@@ -1460,6 +1460,25 @@ namespace Telegram.Views
             }
         }
 
+        public async void ShowHotReactionsPopup()
+        {
+            var chat = ViewModel.Chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var popup = new Telegram.Views.Popups.HotReactionsPopup(ViewModel.ClientService, ViewModel.NavigationService, chat.Id);
+                await popup.ShowQueuedAsync(XamlRoot);
+            }
+            catch (Exception ex)
+            {
+                Telegram.Logger.Exception(ex);
+            }
+        }
+
         public void Search()
         {
             var focused = FocusManagerEx.TryGetFocusedElement(XamlRoot);
@@ -2696,6 +2715,7 @@ namespace Telegram.Views
             }
 
             flyout.CreateFlyoutItem(Search, Strings.Search, Icons.Search, VirtualKey.F);
+            flyout.CreateFlyoutItem(ShowHotReactionsPopup, "🔥 反应排行榜", Icons.Heart);
 
             if (supergroup != null && !supergroup.IsBroadcastGroup && !supergroup.IsDirectMessagesGroup && ((ViewModel.IsPremium || (supergroupFull?.MyBoostCount > 0) || supergroup.Status is ChatMemberStatusCreator or ChatMemberStatusAdministrator)))
             {

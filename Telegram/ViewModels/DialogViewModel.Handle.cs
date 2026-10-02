@@ -852,6 +852,11 @@ namespace Telegram.ViewModels
         {
             if (update.ChatId == _chat?.Id && !update.FromCache)
             {
+                foreach (var id in update.MessageIds)
+                {
+                    Telegram.Services.HotReactions.HotReactionsService.Current.Database.MarkMessageDeleted(update.ChatId, id);
+                }
+
                 var table = update.MessageIds.ToHashSet();
 
                 BeginOnUIThread(() =>
@@ -1138,6 +1143,8 @@ namespace Telegram.ViewModels
         {
             if (update.ChatId == _chat?.Id)
             {
+                Telegram.Services.HotReactions.HotReactionsService.Current.UpdateMessageReaction(update.ChatId, update.MessageId, update.InteractionInfo);
+
                 Handle(update.MessageId, message =>
                 {
                     message.InteractionInfo = update.InteractionInfo;

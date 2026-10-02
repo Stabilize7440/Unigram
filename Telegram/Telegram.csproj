@@ -1500,6 +1500,9 @@
     <Compile Include="Views\Popups\ChooseChatsPopup.xaml.cs">
       <DependentUpon>ChooseChatsPopup.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Views\Popups\HotReactionsPopup.xaml.cs">
+      <DependentUpon>HotReactionsPopup.xaml</DependentUpon>
+    </Compile>
     <Compile Include="Views\Popups\ChatNotificationsPopup.xaml.cs">
       <DependentUpon>ChatNotificationsPopup.xaml</DependentUpon>
     </Compile>
@@ -1797,6 +1800,9 @@
     <Compile Include="Services\GenerationService.cs" />
     <Compile Include="Services\GenerationSources.cs" />
     <Compile Include="Services\CloudUpdateService.cs" />
+    <Compile Include="Services\HotReactions\HotMessageItem.cs" />
+    <Compile Include="Services\HotReactions\HotReactionsDatabase.cs" />
+    <Compile Include="Services\HotReactions\HotReactionsService.cs" />
     <Compile Include="Services\LifetimeService.cs" />
     <Compile Include="Services\LocaleService.cs" />
     <Compile Include="Services\LocationService.cs" />
@@ -3865,6 +3871,10 @@
       <SubType>Designer</SubType>
     </Page>
     <Page Include="Views\Popups\ChooseChatsPopup.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\Popups\HotReactionsPopup.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
