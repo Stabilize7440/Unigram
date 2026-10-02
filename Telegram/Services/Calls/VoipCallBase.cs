@@ -58,7 +58,7 @@ namespace Telegram.Services.Calls
             }
 
             _memoryLogged = (long)MemoryManager.AppMemoryUsage;
-            _memoryLoggedAt = Environment.TickCount64;
+            _memoryLoggedAt = Environment.TickCount;
             _memoryPeak = _memoryLogged;
 
             _memoryTimer = new Timer(OnMemorySample, null, MemorySampleInterval, MemorySampleInterval);
@@ -91,7 +91,7 @@ namespace Telegram.Services.Calls
         private void OnMemorySample(object state)
         {
             var usage = (long)MemoryManager.AppMemoryUsage;
-            var now = Environment.TickCount64;
+            var now = (long)Environment.TickCount;
 
             if (usage > _memoryPeak)
             {

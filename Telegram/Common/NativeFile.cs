@@ -6,6 +6,7 @@
 //
 
 using System.Runtime.InteropServices;
+using System.Security;
 
 namespace Telegram.Common
 {

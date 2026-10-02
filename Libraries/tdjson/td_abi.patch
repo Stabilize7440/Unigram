@@ -1,0 +1,115 @@
+diff --git a/td/telegram/ClientJson.cpp b/td/telegram/ClientJson.cpp
+index a8e93ec18..301ff9c08 100644
+--- a/td/telegram/ClientJson.cpp
++++ b/td/telegram/ClientJson.cpp
+@@ -125,22 +125,34 @@ int json_create_client_id() {
+   return static_cast<int>(get_manager()->create_client_id());
+ }
+ 
+-void json_send(int client_id, Slice request) {
++void json_send(int client_id, int64 request_id, Slice request) {
+   auto parsed_request = to_request(request);
+-  auto request_id = extra_id.fetch_add(1, std::memory_order_relaxed);
+   if (!parsed_request.second.empty()) {
+     std::lock_guard<std::mutex> guard(extra_mutex);
+     extra[request_id] = std::move(parsed_request.second);
+   }
+-  get_manager()->send(client_id, request_id, std::move(parsed_request.first));
++  get_manager()->send(client_id, static_cast<uint64>(request_id), std::move(parsed_request.first));
+ }
+ 
+-const char *json_receive(double timeout) {
++const char *json_receive(double timeout, int *client_id, int64 *request_id) {
+   auto response = get_manager()->receive(timeout);
+   if (!response.object) {
++    if (client_id != nullptr) {
++      *client_id = 0;
++    }
++    if (request_id != nullptr) {
++      *request_id = 0;
++    }
+     return nullptr;
+   }
+ 
++  if (client_id != nullptr) {
++    *client_id = response.client_id;
++  }
++  if (request_id != nullptr) {
++    *request_id = static_cast<int64>(response.request_id);
++  }
++
+   string extra_str;
+   if (response.request_id != 0) {
+     std::lock_guard<std::mutex> guard(extra_mutex);
+diff --git a/td/telegram/ClientJson.h b/td/telegram/ClientJson.h
+index 0b7ea866b..0f5535ed8 100644
+--- a/td/telegram/ClientJson.h
++++ b/td/telegram/ClientJson.h
+@@ -36,9 +36,9 @@ class ClientJson final {
+ 
+ int json_create_client_id();
+ 
+-void json_send(int client_id, Slice request);
++void json_send(int client_id, std::int64_t request_id, Slice request);
+ 
+-const char *json_receive(double timeout);
++const char *json_receive(double timeout, int *client_id, std::int64_t *request_id);
+ 
+ const char *json_execute(Slice request);
+ 
+diff --git a/td/telegram/td_json_client.cpp b/td/telegram/td_json_client.cpp
+index 47d62bef2..7a8a94bb3 100644
+--- a/td/telegram/td_json_client.cpp
++++ b/td/telegram/td_json_client.cpp
+@@ -35,12 +35,12 @@ int td_create_client_id() {
+   return td::json_create_client_id();
+ }
+ 
+-void td_send(int client_id, const char *request) {
+-  td::json_send(client_id, td::Slice(request == nullptr ? "" : request));
++void td_send(int client_id, int64_t request_id, const char *request) {
++  td::json_send(client_id, request_id, td::Slice(request == nullptr ? "" : request));
+ }
+ 
+-const char *td_receive(double timeout) {
+-  return td::json_receive(timeout);
++const char *td_receive(double timeout, int *client_id, int64_t *request_id) {
++  return td::json_receive(timeout, client_id, request_id);
+ }
+ 
+ const char *td_execute(const char *request) {
+diff --git a/td/telegram/td_json_client.h b/td/telegram/td_json_client.h
+index 7ea78bf4c..a28ec3c4d 100644
+--- a/td/telegram/td_json_client.h
++++ b/td/telegram/td_json_client.h
+@@ -49,6 +49,7 @@
+  */
+ 
+ #include "td/telegram/tdjson_export.h"
++#include <stdint.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -64,17 +65,20 @@ TDJSON_EXPORT int td_create_client_id();
+ /**
+  * Sends request to the TDLib client. May be called from any thread.
+  * \param[in] client_id TDLib client identifier.
++ * \param[in] request_id TDLib request identifier.
+  * \param[in] request JSON-serialized null-terminated request to TDLib.
+  */
+-TDJSON_EXPORT void td_send(int client_id, const char *request);
++TDJSON_EXPORT void td_send(int client_id, int64_t request_id, const char *request);
+ 
+ /**
+  * Receives incoming updates and request responses. Must not be called simultaneously from two different threads.
+  * The returned pointer can be used until the next call to td_receive or td_execute, after which it will be deallocated by TDLib.
+  * \param[in] timeout The maximum number of seconds allowed for this function to wait for new data.
++ * \param[out] client_id Returned TDLib client identifier.
++ * \param[out] request_id Returned TDLib request identifier.
+  * \return JSON-serialized null-terminated incoming update or request response. May be NULL if the timeout expires.
+  */
+-TDJSON_EXPORT const char *td_receive(double timeout);
++TDJSON_EXPORT const char *td_receive(double timeout, int *client_id, int64_t *request_id);
+ 
+ /**
+  * Synchronously executes a TDLib request.

@@ -12,6 +12,7 @@ using System.Runtime.CompilerServices;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Security;
 using System.Threading;
 using Telegram.Common;
 using Telegram.Td.Api;

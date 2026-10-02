@@ -727,6 +727,17 @@ namespace Telegram.Navigation
 
             (state as Deferral)?.Complete();
         }
+#else
+        private static readonly TimeSpan ShutdownDrainTimeout = TimeSpan.FromSeconds(1);
+
+        private void ReleaseNative()
+        {
+            _content?.ClearAllToasts();
+        }
+
+        private static void Drain()
+        {
+        }
 #endif
 
         public bool IsInMainView { get; }

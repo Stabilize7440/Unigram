@@ -267,7 +267,7 @@ namespace Telegram.Common
             _frameLast = 0;
             _period = 0;
 
-            Array.Clear(_periods);
+            Array.Clear(_periods, 0, _periods.Length);
         }
     }
 }

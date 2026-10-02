@@ -33,6 +33,8 @@ namespace Telegram.Common
         internal static bool IsReleased(object handle)
             => handle is WinRT.IWinRTObject projected
             && Volatile.Read(ref DisposedFlags(projected.NativeObject)) != 0;
+#else
+        internal static bool IsReleased(object handle) => false;
 #endif
 
         public static byte[] ComputeSHA1(byte[] data)

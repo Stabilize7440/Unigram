@@ -292,3 +292,7 @@ _Pvt_Extensions
 !/Libraries/tlottie/lib/x64/
 !/Libraries/tlottie/lib/ARM64/
 
+# Downloaded CLI build tools
+/Tools/nuget.exe
+
+
