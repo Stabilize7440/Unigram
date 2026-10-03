@@ -233,7 +233,7 @@ namespace Telegram.Controls
 
             if (AppSettings.Diagnostics.EnableWebViewDevTools)
             {
-                _core.OpenDevToolsWindow();
+                // _core.OpenDevToolsWindow();
             }
 
             _core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
