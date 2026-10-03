@@ -57,6 +57,7 @@ namespace Telegram.Controls
             DefaultButton = ContentDialogButton.Primary;
 
             Closing += OnClosing;
+            Closed += OnClosed;
 
             Connected += OnLoaded;
             Disconnected += OnUnloaded;
@@ -74,6 +75,12 @@ namespace Telegram.Controls
         private void OnClosing(ContentDialog sender, ContentDialogClosingEventArgs args)
         {
             _closingResult = args.Result;
+        }
+
+        private void OnClosed(ContentDialog sender, ContentDialogClosedEventArgs args)
+        {
+            _closingResult = args.Result;
+            _closingTask?.TrySetResult(args.Result);
         }
 
         private void OnCloseButtonClick(ContentDialog sender, ContentDialogButtonClickEventArgs args)
@@ -332,6 +339,11 @@ namespace Telegram.Controls
         /// <exception cref="InvalidOperationException">This method can only be invoked from UI thread.</exception>
         public async Task<ContentDialogResult> ShowQueuedAsync(XamlRoot xamlRoot)
         {
+            if (xamlRoot == null)
+            {
+                return ContentDialogResult.None;
+            }
+
             // Shared with ModalPopup, so that the two kinds wait for each other while callers
             // are moved from one to the other.
             await PopupQueue.WaitAsync(xamlRoot);
@@ -350,21 +362,45 @@ namespace Telegram.Controls
             XamlRoot = xamlRoot;
             this.ApplyChatTheme(xamlRoot);
 
-            _closingTask = new TaskCompletionSource<ContentDialogResult>();
-            PopupQueue.Enqueue(xamlRoot, _closingTask);
-            _ = ShowAsync();
+            var queued = new TaskCompletionSource<ContentDialogResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            PopupQueue.Enqueue(xamlRoot, queued);
 
-            if (XamlRoot.TryGetContent(out IPopupHost host))
+            _closingTask = new TaskCompletionSource<ContentDialogResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            ContentDialogResult result = ContentDialogResult.None;
+            bool hostOpened = false;
+
+            try
             {
-                host.PopupOpened();
+                var showTask = ShowAsync().AsTask();
+
+                if (XamlRoot.TryGetContent(out IPopupHost host))
+                {
+                    host.PopupOpened();
+                    hostOpened = true;
+                }
+
+                var completedTask = await Task.WhenAny(_closingTask.Task, showTask);
+                if (completedTask == showTask)
+                {
+                    result = await showTask;
+                }
+                else
+                {
+                    result = await _closingTask.Task;
+                }
             }
-
-            var result = await _closingTask.Task;
-            PopupQueue.Dequeue(xamlRoot);
-
-            if (XamlRoot.TryGetContent(out host))
+            finally
             {
-                host.PopupClosed();
+                // Removed before the waiters are woken: they loop on the table, and a completed task
+                // still in it spins.
+                PopupQueue.Dequeue(xamlRoot, queued);
+                queued.TrySetResult(result);
+
+                if (hostOpened && XamlRoot?.TryGetContent(out IPopupHost host) == true)
+                {
+                    host.PopupClosed();
+                }
             }
 
             return result;

@@ -852,10 +852,7 @@ namespace Telegram.ViewModels
         {
             if (update.ChatId == _chat?.Id && !update.FromCache)
             {
-                foreach (var id in update.MessageIds)
-                {
-                    Telegram.Services.HotReactions.HotReactionsService.Current.Database.MarkMessageDeleted(update.ChatId, id);
-                }
+                Telegram.Services.HotReactions.HotReactionsService.Current.MarkMessagesDeleted(update.ChatId, update.MessageIds);
 
                 var table = update.MessageIds.ToHashSet();
 

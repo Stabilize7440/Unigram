@@ -31,8 +31,8 @@ namespace Telegram.Services.HotReactions
 
     public class ReactionSentimentService
     {
-        private static ReactionSentimentService _current;
-        public static ReactionSentimentService Current => _current ??= new ReactionSentimentService();
+        private static readonly Lazy<ReactionSentimentService> _current = new(() => new ReactionSentimentService(), System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
+        public static ReactionSentimentService Current => _current.Value;
 
         private static readonly HashSet<string> DefaultPositive = new(StringComparer.Ordinal)
         {

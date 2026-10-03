@@ -19,6 +19,7 @@ namespace Telegram.Services.HotReactions
     {
         private static readonly object _lock = new();
         private sqlite3 _db;
+        private volatile bool _isInitialized;
 
         static HotReactionsDatabase()
         {
@@ -32,23 +33,35 @@ namespace Telegram.Services.HotReactions
             }
         }
 
+        public void EnsureInitialized()
+        {
+            if (_isInitialized)
+            {
+                return;
+            }
+            Initialize();
+        }
+
         public void Initialize()
         {
             lock (_lock)
             {
-                if (_db != null)
+                if (_isInitialized)
                 {
                     return;
                 }
 
                 try
                 {
-                    var dbPath = Path.Combine(ApplicationData.Current.LocalFolder.Path, "hot_reactions.db");
-                    var result = raw.sqlite3_open(dbPath, out _db);
-                    if (result != raw.SQLITE_OK)
+                    if (_db == null)
                     {
-                        Logger.Error($"Failed to open hot_reactions.db, code: {result}");
-                        return;
+                        var dbPath = Path.Combine(ApplicationData.Current.LocalFolder.Path, "hot_reactions.db");
+                        var result = raw.sqlite3_open(dbPath, out _db);
+                        if (result != raw.SQLITE_OK)
+                        {
+                            Logger.Error($"Failed to open hot_reactions.db, code: {result}");
+                            return;
+                        }
                     }
 
                     CreateTables();
@@ -71,7 +84,7 @@ namespace Telegram.Services.HotReactions
                     }
                     catch { }
 
-                    var configs = GetSentimentConfigs();
+                    var configs = InternalGetSentimentConfigs();
                     ReactionSentimentService.Current.LoadCustomConfig(configs);
 
                     ExecuteNonQuery("PRAGMA journal_mode = WAL;");
@@ -79,6 +92,8 @@ namespace Telegram.Services.HotReactions
 
                     // 一次性修复：解除此前版本因单批消息数 < 100 误判造成的 cold_sync_completed = 1 封锁
                     ExecuteNonQuery("UPDATE channel_sync_state SET cold_sync_completed = 0 WHERE cold_sync_completed = 1;");
+
+                    _isInitialized = true;
                 }
                 catch (Exception ex)
                 {
@@ -144,6 +159,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null)
                 {
                     return new ChannelSyncState { ChatId = chatId };
@@ -206,6 +222,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null || state == null)
                 {
                     return;
@@ -269,6 +286,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null || messages == null)
                 {
                     return;
@@ -327,6 +345,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null)
                 {
                     return;
@@ -366,6 +385,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null)
                 {
                     return;
@@ -406,6 +426,7 @@ namespace Telegram.Services.HotReactions
             var list = new List<HotMessageItem>();
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null)
                 {
                     return list;
@@ -510,6 +531,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null) return;
 
                 const string sql = @"
@@ -541,39 +563,45 @@ namespace Telegram.Services.HotReactions
             }
         }
 
+        private Dictionary<string, SentimentCategory> InternalGetSentimentConfigs()
+        {
+            var dict = new Dictionary<string, SentimentCategory>(StringComparer.Ordinal);
+            if (_db == null) return dict;
+
+            const string sql = "SELECT emoji, category FROM reaction_sentiment_config;";
+            sqlite3_stmt stmt = null;
+            try
+            {
+                if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
+                {
+                    while (raw.sqlite3_step(stmt) == raw.SQLITE_ROW)
+                    {
+                        var emoji = raw.sqlite3_column_text(stmt, 0).utf8_to_string();
+                        var cat = (SentimentCategory)raw.sqlite3_column_int(stmt, 1);
+                        if (!string.IsNullOrEmpty(emoji))
+                        {
+                            dict[emoji] = cat;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Exception(ex);
+            }
+            finally
+            {
+                if (stmt != null) raw.sqlite3_finalize(stmt);
+            }
+            return dict;
+        }
+
         public Dictionary<string, SentimentCategory> GetSentimentConfigs()
         {
             lock (_lock)
             {
-                var dict = new Dictionary<string, SentimentCategory>(StringComparer.Ordinal);
-                if (_db == null) return dict;
-
-                const string sql = "SELECT emoji, category FROM reaction_sentiment_config;";
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                    {
-                        while (raw.sqlite3_step(stmt) == raw.SQLITE_ROW)
-                        {
-                            var emoji = raw.sqlite3_column_text(stmt, 0).utf8_to_string();
-                            var cat = (SentimentCategory)raw.sqlite3_column_int(stmt, 1);
-                            if (!string.IsNullOrEmpty(emoji))
-                            {
-                                dict[emoji] = cat;
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null) raw.sqlite3_finalize(stmt);
-                }
-                return dict;
+                EnsureInitialized();
+                return InternalGetSentimentConfigs();
             }
         }
 
@@ -581,6 +609,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null || string.IsNullOrEmpty(emoji)) return;
 
                 if (category.HasValue)
@@ -633,6 +662,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null) return;
                 ExecuteNonQuery("DELETE FROM reaction_sentiment_config;");
             }
@@ -642,6 +672,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null)
                 {
                     return 0;
@@ -680,6 +711,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null)
                 {
                     return;
@@ -722,6 +754,7 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
+                EnsureInitialized();
                 if (_db == null)
                 {
                     return;

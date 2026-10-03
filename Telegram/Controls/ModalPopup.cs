@@ -130,20 +130,51 @@ namespace Telegram.Controls
 
         public static async Task WaitAsync(XamlRoot xamlRoot)
         {
+            if (xamlRoot == null)
+            {
+                return;
+            }
+
             while (_requests.TryGetValue(xamlRoot, out var tsc))
             {
+                if (tsc.Task.IsCompleted)
+                {
+                    _requests.Remove(xamlRoot);
+                    break;
+                }
+
                 await tsc.Task;
             }
         }
 
         public static void Enqueue(XamlRoot xamlRoot, TaskCompletionSource<ContentDialogResult> tsc)
         {
+            if (xamlRoot == null || tsc == null)
+            {
+                return;
+            }
+
             _requests.AddOrUpdate(xamlRoot, tsc);
         }
 
-        public static void Dequeue(XamlRoot xamlRoot)
+        public static void Dequeue(XamlRoot xamlRoot, TaskCompletionSource<ContentDialogResult> tsc = null)
         {
-            _requests.Remove(xamlRoot);
+            if (xamlRoot == null)
+            {
+                return;
+            }
+
+            if (tsc != null)
+            {
+                if (_requests.TryGetValue(xamlRoot, out var current) && current == tsc)
+                {
+                    _requests.Remove(xamlRoot);
+                }
+            }
+            else
+            {
+                _requests.Remove(xamlRoot);
+            }
         }
     }
 
@@ -356,17 +387,22 @@ namespace Telegram.Controls
 
             ApplyTheme(xamlRoot);
 
-            var queued = new TaskCompletionSource<ContentDialogResult>();
+            var queued = new TaskCompletionSource<ContentDialogResult>(TaskCreationOptions.RunContinuationsAsynchronously);
             PopupQueue.Enqueue(xamlRoot, queued);
 
-            var result = await ShowAsync(xamlRoot);
-
-            // Removed before the waiters are woken: they loop on the table, and a completed task
-            // still in it spins.
-            PopupQueue.Dequeue(xamlRoot);
-            queued.TrySetResult(result);
-
-            return result;
+            var result = ContentDialogResult.None;
+            try
+            {
+                result = await ShowAsync(xamlRoot);
+                return result;
+            }
+            finally
+            {
+                // Removed before the waiters are woken: they loop on the table, and a completed task
+                // still in it spins.
+                PopupQueue.Dequeue(xamlRoot, queued);
+                queued.TrySetResult(result);
+            }
         }
 
         /// <summary>

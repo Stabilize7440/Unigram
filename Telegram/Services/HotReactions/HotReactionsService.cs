@@ -10,6 +10,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Telegram.Common;
 using Telegram.Td.Api;
@@ -18,12 +19,30 @@ namespace Telegram.Services.HotReactions
 {
     public class HotReactionsService : IDisposable
     {
-        private static HotReactionsService _current;
-        public static HotReactionsService Current => _current ??= new HotReactionsService();
+        private static readonly Lazy<HotReactionsService> _current = new(() => new HotReactionsService(), System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
+        public static HotReactionsService Current => _current.Value;
 
         private readonly HotReactionsDatabase _database;
-        private readonly ConcurrentDictionary<long, CancellationTokenSource> _crawlers = new();
+        private readonly ConcurrentDictionary<long, (CancellationTokenSource Cts, Task WorkerTask)> _crawlers = new();
+        private readonly ConcurrentDictionary<long, int> _crawlerEpochs = new();
+        private readonly ConcurrentDictionary<long, object> _chatLocks = new();
         private readonly ConcurrentDictionary<long, Action<string, bool>> _progressCallbacks = new();
+        private readonly Channel<Action> _dbWriteChannel = Channel.CreateUnbounded<Action>(new UnboundedChannelOptions { SingleReader = true });
+
+        private object GetChatLock(long chatId) => _chatLocks.GetOrAdd(chatId, _ => new object());
+
+        private bool ExecuteIfEpochValid(long chatId, int expectedEpoch, Action action)
+        {
+            lock (GetChatLock(chatId))
+            {
+                if (_crawlerEpochs.TryGetValue(chatId, out var ep) && ep == expectedEpoch)
+                {
+                    action();
+                    return true;
+                }
+                return false;
+            }
+        }
 
         public HotReactionsDatabase Database => _database;
 
@@ -50,7 +69,27 @@ namespace Telegram.Services.HotReactions
         public HotReactionsService()
         {
             _database = new HotReactionsDatabase();
-            _database.Initialize();
+            Task.Run(() => _database.Initialize());
+            Task.Run(ProcessDbWritesAsync);
+        }
+
+        private async Task ProcessDbWritesAsync()
+        {
+            var reader = _dbWriteChannel.Reader;
+            while (await reader.WaitToReadAsync())
+            {
+                while (reader.TryRead(out var action))
+                {
+                    try
+                    {
+                        action();
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Exception(ex);
+                    }
+                }
+            }
         }
 
         public static (int TopCount, string TopEmoji, string ReactionsJson) ExtractReactions(MessageInteractionInfo info)
@@ -136,6 +175,8 @@ namespace Telegram.Services.HotReactions
             {
                 StopColdCrawler(chatId);
             }
+
+            int currentEpoch = _crawlerEpochs.GetOrAdd(chatId, 1);
 
             try
             {
@@ -226,25 +267,33 @@ namespace Telegram.Services.HotReactions
                         fromMessageId = oldestInBatch;
                     }
 
-                    if (itemsToSave.Count > 0)
+                    bool writeOk = ExecuteIfEpochValid(chatId, currentEpoch, () =>
                     {
-                        _database.UpsertMessages(chatId, itemsToSave);
-                    }
+                        if (itemsToSave.Count > 0)
+                        {
+                            _database.UpsertMessages(chatId, itemsToSave);
+                        }
 
-                    _database.FreezeMessagesOlderThan(chatId, sevenDaysAgo);
-                    _database.PruneColdMessages(chatId, state.EffectiveThreshold, sevenDaysAgo);
+                        _database.FreezeMessagesOlderThan(chatId, sevenDaysAgo);
+                        _database.PruneColdMessages(chatId, state.EffectiveThreshold, sevenDaysAgo);
 
-                    state.LastHotSync = now;
-                    if (state.NewestSyncedMsgId == 0 && itemsToSave.Count > 0)
+                        state.LastHotSync = now;
+                        if (state.NewestSyncedMsgId == 0 && itemsToSave.Count > 0)
+                        {
+                            state.NewestSyncedMsgId = itemsToSave[0].MessageId;
+                        }
+                        if (state.OldestSyncedMsgId == 0 && fromMessageId != 0)
+                        {
+                            state.OldestSyncedMsgId = fromMessageId;
+                        }
+
+                        _database.SaveSyncState(state);
+                    });
+
+                    if (!writeOk)
                     {
-                        state.NewestSyncedMsgId = itemsToSave[0].MessageId;
+                        return new List<HotMessageItem>();
                     }
-                    if (state.OldestSyncedMsgId == 0 && fromMessageId != 0)
-                    {
-                        state.OldestSyncedMsgId = fromMessageId;
-                    }
-
-                    _database.SaveSyncState(state);
 
                     return _database.GetTopMessages(chatId, 100, null, state.EffectiveThreshold);
                 });
@@ -252,25 +301,29 @@ namespace Telegram.Services.HotReactions
             catch (Exception ex)
             {
                 Logger.Exception(ex);
-                return _database.GetTopMessages(chatId, 100, null, 1);
+                return await Task.Run(() => _database.GetTopMessages(chatId, 100, null, 1));
             }
         }
 
         public bool IsCrawlerRunning(long chatId)
         {
-            return _crawlers.TryGetValue(chatId, out var cts) && !cts.IsCancellationRequested;
+            return _crawlers.TryGetValue(chatId, out var pair) && !pair.Cts.IsCancellationRequested;
         }
 
-        public void StopColdCrawler(long chatId)
+        public Task StopColdCrawler(long chatId)
         {
-            if (_crawlers.TryRemove(chatId, out var cts))
+            _crawlerEpochs.AddOrUpdate(chatId, 1, (_, v) => v + 1);
+
+            if (_crawlers.TryRemove(chatId, out var pair))
             {
                 try
                 {
-                    cts.Cancel();
+                    pair.Cts.Cancel();
                 }
                 catch { }
+                return pair.WorkerTask;
             }
+            return Task.CompletedTask;
         }
 
         public void StartColdCrawler(IClientService clientService, long chatId, Action<string, bool> onProgress, bool forceResume = false)
@@ -282,23 +335,10 @@ namespace Telegram.Services.HotReactions
                 SetCrawlerProgressCallback(chatId, onProgress);
             }
 
-            var state = _database.GetSyncState(chatId);
-            if (forceResume && state.ColdSyncCompleted)
-            {
-                state.ColdSyncCompleted = false;
-                _database.SaveSyncState(state);
-            }
-
-            if (state.ColdSyncCompleted)
-            {
-                NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
-                return;
-            }
-
+            int currentEpoch = _crawlerEpochs.AddOrUpdate(chatId, 1, (_, v) => v + 1);
             var cts = new CancellationTokenSource();
-            _crawlers[chatId] = cts;
 
-            Task.Run(async () =>
+            var workerTask = Task.Run(async () =>
             {
                 var token = cts.Token;
                 var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -308,6 +348,24 @@ namespace Telegram.Services.HotReactions
 
                 try
                 {
+                    if (token.IsCancellationRequested || (_crawlerEpochs.TryGetValue(chatId, out var ep0) && ep0 != currentEpoch))
+                    {
+                        return;
+                    }
+
+                    var state = _database.GetSyncState(chatId);
+                    if (forceResume && state.ColdSyncCompleted)
+                    {
+                        state.ColdSyncCompleted = false;
+                        ExecuteIfEpochValid(chatId, currentEpoch, () => _database.SaveSyncState(state));
+                    }
+
+                    if (state.ColdSyncCompleted)
+                    {
+                        NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
+                        return;
+                    }
+
                     // 探针获取频道的最初消息时间与 ID，辅助裁定慢爬是否真正到达历史原点
                     var initState = _database.GetSyncState(chatId);
                     if (initState.EarliestMsgDate == 0)
@@ -315,9 +373,16 @@ namespace Telegram.Services.HotReactions
                         var (earliestId, earliestDate) = await GetEarliestMessageAsync(clientService, chatId);
                         if (earliestDate > 0)
                         {
+                            if (token.IsCancellationRequested)
+                            {
+                                return;
+                            }
                             initState.EarliestMsgId = earliestId;
                             initState.EarliestMsgDate = earliestDate;
-                            _database.SaveSyncState(initState);
+                            if (!ExecuteIfEpochValid(chatId, currentEpoch, () => _database.SaveSyncState(initState)))
+                            {
+                                return;
+                            }
                         }
                     }
 
@@ -382,14 +447,20 @@ namespace Telegram.Services.HotReactions
                             if (fromId == 0 || (currentState.EarliestMsgId > 0 && fromId <= currentState.EarliestMsgId))
                             {
                                 currentState.ColdSyncCompleted = true;
-                                if (currentState.SampleCount > 0 && currentState.SampleCount < 50)
+                                bool writeOk = ExecuteIfEpochValid(chatId, currentEpoch, () =>
                                 {
-                                    double avg = (double)currentState.SampleSum / currentState.SampleCount;
-                                    currentState.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
-                                    _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
+                                    if (currentState.SampleCount > 0 && currentState.SampleCount < 50)
+                                    {
+                                        double avg = (double)currentState.SampleSum / currentState.SampleCount;
+                                        currentState.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
+                                        _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
+                                    }
+                                    _database.SaveSyncState(currentState);
+                                });
+                                if (writeOk)
+                                {
+                                    NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
                                 }
-                                _database.SaveSyncState(currentState);
-                                NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
                             }
                             else
                             {
@@ -416,7 +487,10 @@ namespace Telegram.Services.HotReactions
                                 {
                                     double avg = (double)currentState.SampleSum / currentState.SampleCount;
                                     currentState.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
-                                    _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
+                                    ExecuteIfEpochValid(chatId, currentEpoch, () =>
+                                    {
+                                        _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
+                                    });
                                 }
                             }
 
@@ -439,11 +513,6 @@ namespace Telegram.Services.HotReactions
                             }
                         }
 
-                        if (coldItems.Count > 0)
-                        {
-                            _database.UpsertMessages(chatId, coldItems);
-                        }
-
                         bool reachedStart = (currentState.EarliestMsgId > 0 && oldestInBatch <= currentState.EarliestMsgId) ||
                                             (currentState.EarliestMsgDate > 0 && oldestDateInBatch > 0 && oldestDateInBatch <= currentState.EarliestMsgDate);
 
@@ -453,8 +522,10 @@ namespace Telegram.Services.HotReactions
                             if (reachedStart)
                             {
                                 currentState.ColdSyncCompleted = true;
-                                _database.SaveSyncState(currentState);
-                                NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
+                                if (ExecuteIfEpochValid(chatId, currentEpoch, () => _database.SaveSyncState(currentState)))
+                                {
+                                    NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
+                                }
                                 break;
                             }
 
@@ -478,12 +549,27 @@ namespace Telegram.Services.HotReactions
                         if (reachedStart)
                         {
                             currentState.ColdSyncCompleted = true;
+                        }
+
+                        bool writeSuccess = ExecuteIfEpochValid(chatId, currentEpoch, () =>
+                        {
+                            if (coldItems.Count > 0)
+                            {
+                                _database.UpsertMessages(chatId, coldItems);
+                            }
                             _database.SaveSyncState(currentState);
-                            NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
+                        });
+
+                        if (!writeSuccess || token.IsCancellationRequested)
+                        {
                             break;
                         }
 
-                        _database.SaveSyncState(currentState);
+                        if (reachedStart)
+                        {
+                            NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
+                            break;
+                        }
 
                         if (token.IsCancellationRequested)
                         {
@@ -527,7 +613,7 @@ namespace Telegram.Services.HotReactions
                 }
                 finally
                 {
-                    if (_crawlers.TryGetValue(chatId, out var existingCts) && existingCts == cts)
+                    if (_crawlers.TryGetValue(chatId, out var existing) && existing.Cts == cts)
                     {
                         _crawlers.TryRemove(chatId, out _);
                     }
@@ -538,12 +624,40 @@ namespace Telegram.Services.HotReactions
                     catch { }
                 }
             }, cts.Token);
+
+            _crawlers[chatId] = (cts, workerTask);
+        }
+
+        public async Task ResetChannelSyncAsync(long chatId)
+        {
+            var task = StopColdCrawler(chatId);
+            if (task != null && !task.IsCompleted)
+            {
+                try
+                {
+                    await Task.WhenAny(task, Task.Delay(1000));
+                }
+                catch { }
+            }
+
+            await Task.Run(() =>
+            {
+                lock (GetChatLock(chatId))
+                {
+                    _crawlerEpochs.AddOrUpdate(chatId, 1, (_, v) => v + 1);
+                    _database.ResetSyncState(chatId);
+                }
+            });
         }
 
         public void ResetChannelSync(long chatId)
         {
             StopColdCrawler(chatId);
-            _database.ResetSyncState(chatId);
+            lock (GetChatLock(chatId))
+            {
+                _crawlerEpochs.AddOrUpdate(chatId, 1, (_, v) => v + 1);
+                _database.ResetSyncState(chatId);
+            }
         }
 
         public void SetUserCustomThreshold(long chatId, int? threshold)
@@ -562,8 +676,24 @@ namespace Telegram.Services.HotReactions
             var (count, emoji, reactionsJson) = ExtractReactions(interactionInfo);
             if (count <= 0) return;
 
-            // 仅对库中已有条目更新其点赞数与表情，不进行全表扫描与每次剪枝，避免高并发锁冲突
-            _database.UpdateMessageReactionIfExists(chatId, messageId, count, emoji, reactionsJson);
+            // 投递至单消费者无界通道，严格保序并绝不阻塞 TDLib 专有的 TdReceive 接收工作线程
+            _dbWriteChannel.Writer.TryWrite(() =>
+            {
+                _database.UpdateMessageReactionIfExists(chatId, messageId, count, emoji, reactionsJson);
+            });
+        }
+
+        public void MarkMessagesDeleted(long chatId, IEnumerable<long> messageIds)
+        {
+            if (messageIds == null) return;
+            var copy = messageIds.ToArray();
+            _dbWriteChannel.Writer.TryWrite(() =>
+            {
+                foreach (var id in copy)
+                {
+                    _database.MarkMessageDeleted(chatId, id);
+                }
+            });
         }
 
         private static (string Snippet, bool HasMedia) ExtractSnippet(MessageContent content)
@@ -629,7 +759,7 @@ namespace Telegram.Services.HotReactions
         {
             foreach (var kv in _crawlers)
             {
-                try { kv.Value.Cancel(); kv.Value.Dispose(); } catch { }
+                try { kv.Value.Cts.Cancel(); kv.Value.Cts.Dispose(); } catch { }
             }
             _crawlers.Clear();
             _database?.Dispose();
