@@ -329,4 +329,12 @@
     <Content Include="WindowsBase.dll" />
   </ItemGroup>-->
   <Import Project="$(WapProjPath)\Microsoft.DesktopBridge.targets" />
+
+  <!-- The SDK caches the package inventory using only this project's imports as inputs.
+       Files added by a referenced project can reach PackageLayout but be omitted from the
+       final bundle. Regenerate the inventory and its file map on each packaging pass. -->
+  <Target Name="TelegramRefreshPackageFileMap"
+          BeforeTargets="_CreatePriConfigXmlForMainPackageFileMap;_CreateUploadPriConfigXmlForMainPackageFileMap">
+    <Delete Files="$(AppxBundlePriConfigXmlForMainPackageFileMapFileName);$(AppxBundleMainPackageFileMapIntermediatePath);$(AppxUploadBundlePriConfigXmlForMainPackageFileMapFileName);$(AppxUploadBundleMainPackageFileMapIntermediatePath)" />
+  </Target>
 </Project>

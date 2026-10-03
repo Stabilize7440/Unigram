@@ -1503,6 +1503,9 @@
     <Compile Include="Views\Popups\HotReactionsPopup.xaml.cs">
       <DependentUpon>HotReactionsPopup.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Views\HotReactionsPanel.xaml.cs">
+      <DependentUpon>HotReactionsPanel.xaml</DependentUpon>
+    </Compile>
     <Compile Include="Views\Popups\ChatNotificationsPopup.xaml.cs">
       <DependentUpon>ChatNotificationsPopup.xaml</DependentUpon>
     </Compile>
@@ -3876,6 +3879,10 @@
       <SubType>Designer</SubType>
     </Page>
     <Page Include="Views\Popups\HotReactionsPopup.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\HotReactionsPanel.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>

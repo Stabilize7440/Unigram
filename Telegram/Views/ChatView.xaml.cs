@@ -1286,6 +1286,8 @@ namespace Telegram.Views
 
             UnloadVisibleMessages();
 
+            _hotReactionsPanel?.Close();
+
             ViewModel.NavigationService.Window.EnableScreenCapture(GetHashCode());
 
             ViewModel.NavigationService.Window.Activated -= Window_Activated;
@@ -1460,30 +1462,121 @@ namespace Telegram.Views
             }
         }
 
-        private bool _isHotReactionsPopupShowing;
-
-        public async void ShowHotReactionsPopup()
+        private static void HotLog(string msg)
         {
-            var chat = ViewModel.Chat;
-            if (chat == null || _isHotReactionsPopupShowing)
+            try
+            {
+                var dir = Windows.Storage.ApplicationData.Current.LocalFolder.Path;
+                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "hot_debug.log"), $"[{DateTime.Now:HH:mm:ss.fff}] [ChatView] {msg}\r\n");
+            }
+            catch { }
+        }
+
+        private HotReactionsPanel _hotReactionsPanel;
+
+        private bool EnsureHotReactionsSidePanel()
+        {
+            if (_hotReactionsPanel == null)
+            {
+                HotLog("EnsureHotReactionsSidePanel: instantiating HotReactionsPanel");
+                try
+                {
+                    _hotReactionsPanel = new HotReactionsPanel();
+                    _hotReactionsPanel.CloseRequested += (s, e) => CloseHotReactions();
+                    if (HotReactionsHost != null)
+                    {
+                        HotReactionsHost.Child = _hotReactionsPanel;
+                    }
+                    HotLog("EnsureHotReactionsSidePanel: successfully created and mounted HotReactionsPanel");
+                }
+                catch (Exception ex)
+                {
+                    HotLog($"EnsureHotReactionsSidePanel EXCEPTION creating panel: {ex}");
+                    Telegram.Logger.Exception(ex);
+                    return false;
+                }
+            }
+            return _hotReactionsPanel != null;
+        }
+
+        public void ToggleHotReactions()
+        {
+            HotLog($"ToggleHotReactions called, host null? {HotReactionsHost == null}");
+            if (HotReactionsHost != null && HotReactionsHost.Visibility == Visibility.Visible)
+            {
+                CloseHotReactions();
+            }
+            else
+            {
+                OpenHotReactions();
+            }
+        }
+
+        public async void OpenHotReactions()
+        {
+            var chat = ViewModel?.Chat;
+            HotLog($"OpenHotReactions: chat is {(chat == null ? "null" : chat.Id.ToString())}");
+            if (chat == null)
             {
                 return;
             }
 
-            _isHotReactionsPopupShowing = true;
             try
             {
-                var popup = new Telegram.Views.Popups.HotReactionsPopup(ViewModel.ClientService, ViewModel.NavigationService, chat.Id);
-                await popup.ShowQueuedAsync(XamlRoot);
+                if (!EnsureHotReactionsSidePanel())
+                {
+                    HotLog("OpenHotReactions: EnsureHotReactionsSidePanel returned false, aborting!");
+                    return;
+                }
+
+                if (HotReactionsHost != null)
+                {
+                    HotReactionsHost.Visibility = Visibility.Visible;
+                }
+
+                _hotReactionsPanel.Visibility = Visibility.Visible;
+                _hotReactionsPanel.Initialize(ViewModel.ClientService, ViewModel.NavigationService, ViewModel);
+                await _hotReactionsPanel.OpenAsync(chat.Id);
             }
             catch (Exception ex)
             {
+                HotLog($"OpenHotReactions EXCEPTION: {ex}");
                 Telegram.Logger.Exception(ex);
             }
-            finally
+        }
+
+        private async void SafeUpdateSidePanelChatAsync(long chatId)
+        {
+            try
             {
-                _isHotReactionsPopupShowing = false;
+                if (_hotReactionsPanel != null)
+                {
+                    await _hotReactionsPanel.OpenAsync(chatId);
+                }
             }
+            catch (Exception ex)
+            {
+                HotLog($"SafeUpdateSidePanelChatAsync EXCEPTION: {ex}");
+                Telegram.Logger.Exception(ex);
+            }
+        }
+
+        public void CloseHotReactions()
+        {
+            if (HotReactionsHost != null)
+            {
+                HotReactionsHost.Visibility = Visibility.Collapsed;
+            }
+            if (_hotReactionsPanel != null)
+            {
+                _hotReactionsPanel.Close();
+                _hotReactionsPanel.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        public void ShowHotReactionsPopup()
+        {
+            ToggleHotReactions();
         }
 
         public void Search()
@@ -1766,6 +1859,13 @@ namespace Telegram.Views
             }
             else
             {
+                if (HotReactionsHost != null && HotReactionsHost.Visibility == Visibility.Visible)
+                {
+                    CloseHotReactions();
+                    args.Handled = true;
+                    return;
+                }
+
                 if (ViewModel.Search != null)
                 {
                     args.Handled = SearchMask.OnBackRequested();
@@ -2722,7 +2822,7 @@ namespace Telegram.Views
             }
 
             flyout.CreateFlyoutItem(Search, Strings.Search, Icons.Search, VirtualKey.F);
-            flyout.CreateFlyoutItem(ShowHotReactionsPopup, "🔥 反应排行榜", Icons.Heart);
+            flyout.CreateFlyoutItem(ToggleHotReactions, "🔥 反应排行榜", Icons.Heart);
 
             if (supergroup != null && !supergroup.IsBroadcastGroup && !supergroup.IsDirectMessagesGroup && ((ViewModel.IsPremium || (supergroupFull?.MyBoostCount > 0) || supergroup.Status is ChatMemberStatusCreator or ChatMemberStatusAdministrator)))
             {
@@ -5741,6 +5841,26 @@ namespace Telegram.Views
 
         public void UpdateChat(Chat chat)
         {
+            if (HotReactionsHost != null && HotReactionsHost.Visibility == Visibility.Visible && _hotReactionsPanel != null)
+            {
+                if (chat != null && chat.Type is ChatTypeSupergroup)
+                {
+                    try
+                    {
+                        _hotReactionsPanel.Initialize(ViewModel?.ClientService, ViewModel?.NavigationService, ViewModel);
+                        SafeUpdateSidePanelChatAsync(chat.Id);
+                    }
+                    catch (Exception ex)
+                    {
+                        Telegram.Logger.Exception(ex);
+                    }
+                }
+                else
+                {
+                    CloseHotReactions();
+                }
+            }
+
             UpdateChatTitle(chat);
             UpdateChatPhoto(chat);
             UpdateChatEmojiStatus(chat);

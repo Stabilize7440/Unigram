@@ -421,11 +421,7 @@
         </DataTemplate>
     </UserControl.Resources>
 
-    <Grid x:Name="LayoutRoot"
-          Background="Transparent"
-          AllowDrop="True"
-          DragOver="OnDragOver"
-          Drop="OnDrop">
+    <Grid Background="Transparent">
         <VisualStateManager.VisualStateGroups>
             <VisualStateGroup>
                 <VisualState x:Name="FilledState" />
@@ -467,6 +463,18 @@
                 </VisualState>
             </VisualStateGroup>
         </VisualStateManager.VisualStateGroups>
+
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+
+        <Grid x:Name="LayoutRoot"
+              Grid.Column="0"
+              Background="Transparent"
+              AllowDrop="True"
+              DragOver="OnDragOver"
+              Drop="OnDrop">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="Auto" />
             <ColumnDefinition />
@@ -1634,5 +1642,11 @@
                              Grid.RowSpan="3"
                              Grid.ColumnSpan="2"
                              Canvas.ZIndex="3" />
+        </Grid>
+
+        <Border x:Name="HotReactionsHost"
+                Width="380"
+                Visibility="Collapsed"
+                Grid.Column="1" />
     </Grid>
 </controls:UserControlEx>
