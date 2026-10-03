@@ -18,7 +18,7 @@
 	url = https://github.com/ahmed605/CoreWindowCustomDPI.git
 [submodule "Libraries/tdlib"]
 	path = Libraries/tdlib
-	url = https://github.com/tdlib/td.git
+	url = https://github.com/Stabilize7440/td.git
 [submodule "Libraries/MicroTeX"]
 	path = Libraries/MicroTeX
 	url = https://github.com/desktop-app/MicroTeX.git
