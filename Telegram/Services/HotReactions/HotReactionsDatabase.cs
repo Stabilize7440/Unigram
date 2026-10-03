@@ -74,6 +74,9 @@ namespace Telegram.Services.HotReactions
                     var configs = GetSentimentConfigs();
                     ReactionSentimentService.Current.LoadCustomConfig(configs);
 
+                    ExecuteNonQuery("PRAGMA journal_mode = WAL;");
+                    ExecuteNonQuery("PRAGMA busy_timeout = 3000;");
+
                     // 一次性修复：解除此前版本因单批消息数 < 100 误判造成的 cold_sync_completed = 1 封锁
                     ExecuteNonQuery("UPDATE channel_sync_state SET cold_sync_completed = 0 WHERE cold_sync_completed = 1;");
                 }
@@ -400,9 +403,9 @@ namespace Telegram.Services.HotReactions
 
         public List<HotMessageItem> GetTopMessages(long chatId, int limit = 0, long? minDate = null, int minReactions = 1, HotRankMode mode = HotRankMode.All)
         {
+            var list = new List<HotMessageItem>();
             lock (_lock)
             {
-                var list = new List<HotMessageItem>();
                 if (_db == null)
                 {
                     return list;
@@ -469,37 +472,72 @@ namespace Telegram.Services.HotReactions
                         raw.sqlite3_finalize(stmt);
                     }
                 }
+            }
 
-                if (mode == HotRankMode.All)
-                {
-                    foreach (var item in list)
-                    {
-                        var (score, badge, sub) = ReactionSentimentService.Current.EvaluateMessage(item, mode);
-                        item.DisplayScore = score;
-                        item.DisplayBadge = badge;
-                        item.SubDetailText = sub;
-                    }
-                    return limit > 0 ? list.Take(limit).ToList() : list;
-                }
-
-                var evaluated = new List<HotMessageItem>();
+            if (mode == HotRankMode.All)
+            {
                 foreach (var item in list)
                 {
                     var (score, badge, sub) = ReactionSentimentService.Current.EvaluateMessage(item, mode);
-                    if (score >= minReactions && score > 0)
+                    item.DisplayScore = score;
+                    item.DisplayBadge = badge;
+                    item.SubDetailText = sub;
+                }
+                return limit > 0 ? list.Take(limit).ToList() : list;
+            }
+
+            var evaluated = new List<HotMessageItem>();
+            foreach (var item in list)
+            {
+                var (score, badge, sub) = ReactionSentimentService.Current.EvaluateMessage(item, mode);
+                if (score >= minReactions && score > 0)
+                {
+                    item.DisplayScore = score;
+                    item.DisplayBadge = badge;
+                    item.SubDetailText = sub;
+                    evaluated.Add(item);
+                }
+            }
+
+            var ordered = evaluated
+                .OrderByDescending(x => x.DisplayScore)
+                .ThenByDescending(x => x.Date);
+
+            return limit > 0 ? ordered.Take(limit).ToList() : ordered.ToList();
+        }
+
+        public void UpdateMessageReactionIfExists(long chatId, long messageId, int count, string emoji, string reactionsJson)
+        {
+            lock (_lock)
+            {
+                if (_db == null) return;
+
+                const string sql = @"
+                    UPDATE channel_hot_messages 
+                    SET max_reaction_count = ?, top_emoji = ?, reactions_json = ?
+                    WHERE chat_id = ? AND message_id = ?;";
+
+                sqlite3_stmt stmt = null;
+                try
+                {
+                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
                     {
-                        item.DisplayScore = score;
-                        item.DisplayBadge = badge;
-                        item.SubDetailText = sub;
-                        evaluated.Add(item);
+                        raw.sqlite3_bind_int(stmt, 1, count);
+                        raw.sqlite3_bind_text(stmt, 2, emoji ?? "👍");
+                        raw.sqlite3_bind_text(stmt, 3, reactionsJson ?? string.Empty);
+                        raw.sqlite3_bind_int64(stmt, 4, chatId);
+                        raw.sqlite3_bind_int64(stmt, 5, messageId);
+                        raw.sqlite3_step(stmt);
                     }
                 }
-
-                var ordered = evaluated
-                    .OrderByDescending(x => x.DisplayScore)
-                    .ThenByDescending(x => x.Date);
-
-                return limit > 0 ? ordered.Take(limit).ToList() : ordered.ToList();
+                catch (Exception ex)
+                {
+                    Logger.Exception(ex);
+                }
+                finally
+                {
+                    if (stmt != null) raw.sqlite3_finalize(stmt);
+                }
             }
         }
 

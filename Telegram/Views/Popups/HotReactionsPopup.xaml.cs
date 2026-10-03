@@ -49,9 +49,17 @@ namespace Telegram.Views.Popups
         {
             UpdateFilterButtons();
             UpdateRankModeButtons();
+
+            // 1. 注册慢爬进度监听（若后台慢爬正在运行，立刻无缝接管）
+            HotReactionsService.Current.SetCrawlerProgressCallback(_chatId, OnCrawlerProgress);
+
+            // 2. 秒开：优先呈现本地已有索引，杜绝空白菊花等待
+            await ReloadListAsync(resetPage: true);
+
+            // 3. 静默增量同步近7天热区消息
             await RefreshDataAsync();
 
-            // 仅在用户未主动暂停且当前没有爬虫在跑时，才启动冷区后台慢爬
+            // 4. 仅在用户未主动暂停且当前没有爬虫在跑时，才启动冷区后台慢爬
             if (!_userPausedCrawler && !HotReactionsService.Current.IsCrawlerRunning(_chatId))
             {
                 HotReactionsService.Current.StartColdCrawler(_clientService, _chatId, OnCrawlerProgress);
@@ -60,14 +68,18 @@ namespace Telegram.Views.Popups
 
         private void OnPopupUnloaded(object sender, RoutedEventArgs e)
         {
-            // 弹窗关闭后允许后台慢爬继续静默跑，服务层自会节流
+            // 弹窗关闭时解绑进度回调，后台慢爬静默运行，不会向已卸载的弹窗发送 Dispatcher 消息
+            HotReactionsService.Current.SetCrawlerProgressCallback(_chatId, null);
         }
 
         private async Task RefreshDataAsync()
         {
-            LoadingRing.IsActive = true;
-            LoadingRing.Visibility = Visibility.Visible;
-            EmptyNotice.Visibility = Visibility.Collapsed;
+            if (_allCurrentItems.Count == 0)
+            {
+                LoadingRing.IsActive = true;
+                LoadingRing.Visibility = Visibility.Visible;
+                EmptyNotice.Visibility = Visibility.Collapsed;
+            }
 
             try
             {
@@ -79,8 +91,7 @@ namespace Telegram.Views.Popups
                     });
                 });
 
-                UpdateThresholdUI();
-                ReloadList(resetPage: true);
+                await ReloadListAsync(resetPage: true);
             }
             catch (Exception ex)
             {
@@ -93,9 +104,9 @@ namespace Telegram.Views.Popups
             }
         }
 
-        private void UpdateThresholdUI()
+        private void UpdateThresholdUI(ChannelSyncState state = null)
         {
-            var state = HotReactionsService.Current.Database.GetSyncState(_chatId);
+            state ??= HotReactionsService.Current.Database.GetSyncState(_chatId);
 
             if (state.CustomThreshold.HasValue)
             {
@@ -116,19 +127,33 @@ namespace Telegram.Views.Popups
             }
         }
 
-        private void ReloadList(bool resetPage = false)
+        private async Task ReloadListAsync(bool resetPage = false)
         {
             if (resetPage)
             {
                 _currentPage = 1;
             }
 
-            var state = HotReactionsService.Current.Database.GetSyncState(_chatId);
-            long? minDate = _isWeekOnly ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (7 * 86400) : null;
+            var chatId = _chatId;
+            var isWeekOnly = _isWeekOnly;
+            var rankMode = _rankMode;
 
-            // limit = 0 取出满足门槛的所有高赞条目，进行全局排序与情绪打分
-            _allCurrentItems = HotReactionsService.Current.Database.GetTopMessages(_chatId, 0, minDate, state.EffectiveThreshold, _rankMode);
+            // 数据库读取、JSON解析与情绪重排全部移至后台线程，确保 UI 线程 100% 丝滑
+            var (items, state) = await Task.Run(() =>
+            {
+                var syncState = HotReactionsService.Current.Database.GetSyncState(chatId);
+                long? minDate = isWeekOnly ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (7 * 86400) : null;
+                var topItems = HotReactionsService.Current.Database.GetTopMessages(chatId, 0, minDate, syncState.EffectiveThreshold, rankMode);
+                return (topItems, syncState);
+            });
 
+            _allCurrentItems = items;
+            UpdateThresholdUI(state);
+            RenderCurrentPage();
+        }
+
+        private void RenderCurrentPage()
+        {
             int totalCount = _allCurrentItems.Count;
             int totalPages = Math.Max(1, (int)Math.Ceiling((double)totalCount / PageSize));
 
@@ -158,7 +183,7 @@ namespace Telegram.Views.Popups
             if (_currentPage > 1)
             {
                 _currentPage--;
-                ReloadList(resetPage: false);
+                RenderCurrentPage();
                 ScrollListToTop();
             }
         }
@@ -169,7 +194,7 @@ namespace Telegram.Views.Popups
             if (_currentPage < totalPages)
             {
                 _currentPage++;
-                ReloadList(resetPage: false);
+                RenderCurrentPage();
                 ScrollListToTop();
             }
         }
@@ -197,7 +222,7 @@ namespace Telegram.Views.Popups
             {
                 _rankMode = HotRankMode.NetPositive;
                 UpdateRankModeButtons();
-                ReloadList(resetPage: true);
+                _ = ReloadListAsync(resetPage: true);
             }
         }
 
@@ -207,7 +232,7 @@ namespace Telegram.Views.Popups
             {
                 _rankMode = HotRankMode.Positive;
                 UpdateRankModeButtons();
-                ReloadList(resetPage: true);
+                _ = ReloadListAsync(resetPage: true);
             }
         }
 
@@ -217,7 +242,7 @@ namespace Telegram.Views.Popups
             {
                 _rankMode = HotRankMode.Negative;
                 UpdateRankModeButtons();
-                ReloadList(resetPage: true);
+                _ = ReloadListAsync(resetPage: true);
             }
         }
 
@@ -227,7 +252,7 @@ namespace Telegram.Views.Popups
             {
                 _rankMode = HotRankMode.Shock;
                 UpdateRankModeButtons();
-                ReloadList(resetPage: true);
+                _ = ReloadListAsync(resetPage: true);
             }
         }
 
@@ -237,7 +262,7 @@ namespace Telegram.Views.Popups
             {
                 _rankMode = HotRankMode.All;
                 UpdateRankModeButtons();
-                ReloadList(resetPage: true);
+                _ = ReloadListAsync(resetPage: true);
             }
         }
 
@@ -254,7 +279,7 @@ namespace Telegram.Views.Popups
                 HotReactionsService.Current.Database.SaveSentimentConfig(emoji, category);
 
                 ConfigEmojiInput.Text = string.Empty;
-                ReloadList(resetPage: false);
+                _ = ReloadListAsync(resetPage: false);
             }
         }
 
@@ -263,7 +288,7 @@ namespace Telegram.Views.Popups
             ReactionSentimentService.Current.ResetToDefaults();
             HotReactionsService.Current.Database.ClearSentimentConfigs();
             ConfigEmojiInput.Text = string.Empty;
-            ReloadList(resetPage: false);
+            _ = ReloadListAsync(resetPage: false);
         }
 
         private void UpdateFilterButtons()
@@ -278,7 +303,7 @@ namespace Telegram.Views.Popups
             {
                 _isWeekOnly = true;
                 UpdateFilterButtons();
-                ReloadList(resetPage: true);
+                _ = ReloadListAsync(resetPage: true);
             }
         }
 
@@ -288,7 +313,7 @@ namespace Telegram.Views.Popups
             {
                 _isWeekOnly = false;
                 UpdateFilterButtons();
-                ReloadList(resetPage: true);
+                _ = ReloadListAsync(resetPage: true);
 
                 if (!_userPausedCrawler && !HotReactionsService.Current.IsCrawlerRunning(_chatId))
                 {
@@ -310,8 +335,7 @@ namespace Telegram.Views.Popups
                 HotReactionsService.Current.SetUserCustomThreshold(_chatId, customVal);
             }
 
-            UpdateThresholdUI();
-            ReloadList(resetPage: true);
+            _ = ReloadListAsync(resetPage: true);
         }
 
         private async void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -324,8 +348,7 @@ namespace Telegram.Views.Popups
             _userPausedCrawler = false;
             HotReactionsService.Current.ResetChannelSync(_chatId);
             CrawlerStatusText.Text = "已重置频道历史索引，重新全量扫描...";
-            UpdateThresholdUI();
-            ReloadList(resetPage: true);
+            await ReloadListAsync(resetPage: true);
             await RefreshDataAsync();
             if (!_userPausedCrawler)
             {
@@ -354,7 +377,7 @@ namespace Telegram.Views.Popups
 
         private void OnCrawlerProgress(string status, bool isRunning)
         {
-            var ignored = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+            var ignored = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, async () =>
             {
                 if (_userPausedCrawler && isRunning)
                 {
@@ -365,8 +388,7 @@ namespace Telegram.Views.Popups
                 CrawlerStatusText.Text = status;
                 CrawlerToggleBtn.Content = isRunning ? "暂停慢爬" : "继续慢爬";
 
-                UpdateThresholdUI();
-                ReloadList(resetPage: false);
+                await ReloadListAsync(resetPage: false);
             });
         }
 

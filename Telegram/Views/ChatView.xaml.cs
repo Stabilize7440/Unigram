@@ -1460,14 +1460,17 @@ namespace Telegram.Views
             }
         }
 
+        private bool _isHotReactionsPopupShowing;
+
         public async void ShowHotReactionsPopup()
         {
             var chat = ViewModel.Chat;
-            if (chat == null)
+            if (chat == null || _isHotReactionsPopupShowing)
             {
                 return;
             }
 
+            _isHotReactionsPopupShowing = true;
             try
             {
                 var popup = new Telegram.Views.Popups.HotReactionsPopup(ViewModel.ClientService, ViewModel.NavigationService, chat.Id);
@@ -1476,6 +1479,10 @@ namespace Telegram.Views
             catch (Exception ex)
             {
                 Telegram.Logger.Exception(ex);
+            }
+            finally
+            {
+                _isHotReactionsPopupShowing = false;
             }
         }
 

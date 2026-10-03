@@ -23,8 +23,29 @@ namespace Telegram.Services.HotReactions
 
         private readonly HotReactionsDatabase _database;
         private readonly ConcurrentDictionary<long, CancellationTokenSource> _crawlers = new();
+        private readonly ConcurrentDictionary<long, Action<string, bool>> _progressCallbacks = new();
 
         public HotReactionsDatabase Database => _database;
+
+        public void SetCrawlerProgressCallback(long chatId, Action<string, bool> callback)
+        {
+            if (callback != null)
+            {
+                _progressCallbacks[chatId] = callback;
+            }
+            else
+            {
+                _progressCallbacks.TryRemove(chatId, out _);
+            }
+        }
+
+        private void NotifyCrawlerProgress(long chatId, string status, bool isRunning)
+        {
+            if (_progressCallbacks.TryGetValue(chatId, out var callback))
+            {
+                callback?.Invoke(status, isRunning);
+            }
+        }
 
         public HotReactionsService()
         {
@@ -108,90 +129,131 @@ namespace Telegram.Services.HotReactions
 
         public async Task<List<HotMessageItem>> SyncHotWindowAsync(IClientService clientService, long chatId, Action<string> progressCallback = null)
         {
-            var state = _database.GetSyncState(chatId);
-            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var sevenDaysAgo = now - (7 * 86400);
-
-            var itemsToSave = new List<HotMessageItem>();
-            long fromMessageId = 0;
-            int totalFetched = 0;
-            bool reachedEnd = false;
-
-            progressCallback?.Invoke("正在同步近7天消息...");
-
-            while (totalFetched < 500 && !reachedEnd)
+            // 为避免同一个 Chat 的 GetChatHistory 请求在 TDLib 内部发生并发冲突或排队挂起，
+            // 若后台慢爬正在运行，先暂时停止
+            bool crawlerWasRunning = IsCrawlerRunning(chatId);
+            if (crawlerWasRunning)
             {
-                var response = await clientService.SendAsync(new GetChatHistory(chatId, fromMessageId, 0, 100, false));
-                if (response is not Messages messages || messages.MessagesValue.Count == 0)
+                StopColdCrawler(chatId);
+            }
+
+            try
+            {
+                return await Task.Run(async () =>
                 {
-                    reachedEnd = true;
-                    break;
-                }
+                    var state = _database.GetSyncState(chatId);
+                    var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    var sevenDaysAgo = now - (7 * 86400);
 
-                foreach (var msg in messages.MessagesValue)
-                {
-                    totalFetched++;
+                    var itemsToSave = new List<HotMessageItem>();
+                    long fromMessageId = 0;
+                    int totalFetched = 0;
+                    bool reachedEnd = false;
 
-                    if (msg.Date < sevenDaysAgo)
+                    progressCallback?.Invoke("正在同步近7天消息...");
+
+                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+                    while (totalFetched < 500 && !reachedEnd && !timeoutCts.IsCancellationRequested)
                     {
-                        reachedEnd = true;
-                    }
+                        var sendTask = clientService.SendAsync(new GetChatHistory(chatId, fromMessageId, 0, 100, false));
+                        var completed = await Task.WhenAny(sendTask, Task.Delay(4000, timeoutCts.Token));
 
-                    var (count, emoji, reactionsJson) = ExtractReactions(msg.InteractionInfo);
-                    if (count > 0 && state.SampleCount < 50)
-                    {
-                        state.SampleCount++;
-                        state.SampleSum += count;
-                        if (state.SampleCount == 50)
+                        if (completed != sendTask)
                         {
-                            double avg = (double)state.SampleSum / state.SampleCount;
-                            state.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
+                            // 单次请求超时（4秒），防止 TDLib 内部死锁或无响应
+                            break;
                         }
-                    }
 
-                    if (count > 0)
-                    {
-                        var (snippet, hasMedia) = ExtractSnippet(msg.Content);
-                        itemsToSave.Add(new HotMessageItem
+                        var response = await sendTask;
+                        if (response is not Messages messages || messages.MessagesValue.Count == 0)
                         {
-                            ChatId = chatId,
-                            MessageId = msg.Id,
-                            Date = msg.Date,
-                            MaxReactionCount = count,
-                            TopEmoji = emoji,
-                            ReactionsJson = reactionsJson,
-                            Snippet = snippet,
-                            SenderName = GetSenderDisplayName(clientService, msg.SenderId),
-                            HasMedia = hasMedia,
-                            IsCold = msg.Date < sevenDaysAgo
-                        });
+                            reachedEnd = true;
+                            break;
+                        }
+
+                        long oldestInBatch = fromMessageId;
+
+                        foreach (var msg in messages.MessagesValue)
+                        {
+                            totalFetched++;
+                            oldestInBatch = msg.Id;
+
+                            if (msg.Date < sevenDaysAgo)
+                            {
+                                reachedEnd = true;
+                            }
+
+                            var (count, emoji, reactionsJson) = ExtractReactions(msg.InteractionInfo);
+                            if (count > 0 && state.SampleCount < 50)
+                            {
+                                state.SampleCount++;
+                                state.SampleSum += count;
+                                if (state.SampleCount == 50)
+                                {
+                                    double avg = (double)state.SampleSum / state.SampleCount;
+                                    state.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
+                                }
+                            }
+
+                            if (count > 0)
+                            {
+                                var (snippet, hasMedia) = ExtractSnippet(msg.Content);
+                                itemsToSave.Add(new HotMessageItem
+                                {
+                                    ChatId = chatId,
+                                    MessageId = msg.Id,
+                                    Date = msg.Date,
+                                    MaxReactionCount = count,
+                                    TopEmoji = emoji,
+                                    ReactionsJson = reactionsJson,
+                                    Snippet = snippet,
+                                    SenderName = GetSenderDisplayName(clientService, msg.SenderId),
+                                    HasMedia = hasMedia,
+                                    IsCold = msg.Date < sevenDaysAgo
+                                });
+                            }
+                        }
+
+                        // 关键防停滞/历史触底检测：
+                        // 当频道历史到头时，TDLib 不会返回空列表，而是返回包含起点自身的单条记录
+                        if (oldestInBatch == fromMessageId && fromMessageId != 0)
+                        {
+                            reachedEnd = true;
+                            break;
+                        }
+
+                        fromMessageId = oldestInBatch;
                     }
 
-                    fromMessageId = msg.Id;
-                }
-            }
+                    if (itemsToSave.Count > 0)
+                    {
+                        _database.UpsertMessages(chatId, itemsToSave);
+                    }
 
-            if (itemsToSave.Count > 0)
+                    _database.FreezeMessagesOlderThan(chatId, sevenDaysAgo);
+                    _database.PruneColdMessages(chatId, state.EffectiveThreshold, sevenDaysAgo);
+
+                    state.LastHotSync = now;
+                    if (state.NewestSyncedMsgId == 0 && itemsToSave.Count > 0)
+                    {
+                        state.NewestSyncedMsgId = itemsToSave[0].MessageId;
+                    }
+                    if (state.OldestSyncedMsgId == 0 && fromMessageId != 0)
+                    {
+                        state.OldestSyncedMsgId = fromMessageId;
+                    }
+
+                    _database.SaveSyncState(state);
+
+                    return _database.GetTopMessages(chatId, 100, null, state.EffectiveThreshold);
+                });
+            }
+            catch (Exception ex)
             {
-                _database.UpsertMessages(chatId, itemsToSave);
+                Logger.Exception(ex);
+                return _database.GetTopMessages(chatId, 100, null, 1);
             }
-
-            _database.FreezeMessagesOlderThan(chatId, sevenDaysAgo);
-            _database.PruneColdMessages(chatId, state.EffectiveThreshold, sevenDaysAgo);
-
-            state.LastHotSync = now;
-            if (state.NewestSyncedMsgId == 0 && itemsToSave.Count > 0)
-            {
-                state.NewestSyncedMsgId = itemsToSave[0].MessageId;
-            }
-            if (state.OldestSyncedMsgId == 0 && fromMessageId != 0)
-            {
-                state.OldestSyncedMsgId = fromMessageId;
-            }
-
-            _database.SaveSyncState(state);
-
-            return _database.GetTopMessages(chatId, 100, null, state.EffectiveThreshold);
         }
 
         public bool IsCrawlerRunning(long chatId)
@@ -215,6 +277,11 @@ namespace Telegram.Services.HotReactions
         {
             StopColdCrawler(chatId);
 
+            if (onProgress != null)
+            {
+                SetCrawlerProgressCallback(chatId, onProgress);
+            }
+
             var state = _database.GetSyncState(chatId);
             if (forceResume && state.ColdSyncCompleted)
             {
@@ -224,7 +291,7 @@ namespace Telegram.Services.HotReactions
 
             if (state.ColdSyncCompleted)
             {
-                onProgress?.Invoke("历史消息已全部扫描完毕", false);
+                NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
                 return;
             }
 
@@ -259,7 +326,7 @@ namespace Telegram.Services.HotReactions
                         var currentState = _database.GetSyncState(chatId);
                         if (currentState.ColdSyncCompleted)
                         {
-                            onProgress?.Invoke("历史消息已全部扫描完毕", false);
+                            NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
                             break;
                         }
 
@@ -282,14 +349,14 @@ namespace Telegram.Services.HotReactions
                                 {
                                     delay = Math.Clamp(waitSec, 2, 60);
                                 }
-                                onProgress?.Invoke($"触发限流，等待 {delay} 秒后重试...", true);
+                                NotifyCrawlerProgress(chatId, $"触发限流，等待 {delay} 秒后重试...", true);
                                 await Task.Delay(delay * 1000, token);
                                 continue;
                             }
 
                             if (consecutiveErrors >= 3)
                             {
-                                onProgress?.Invoke($"慢爬网络暂停：{error.Message}", false);
+                                NotifyCrawlerProgress(chatId, $"慢爬网络暂停：{error.Message}", false);
                                 break;
                             }
 
@@ -306,7 +373,7 @@ namespace Telegram.Services.HotReactions
                             if (stallCount < 4)
                             {
                                 stallCount++;
-                                onProgress?.Invoke($"正在同步历史深处数据 (重试 {stallCount}/4)...", true);
+                                NotifyCrawlerProgress(chatId, $"正在同步历史深处数据 (重试 {stallCount}/4)...", true);
                                 await Task.Delay(2000, token);
                                 continue;
                             }
@@ -322,11 +389,11 @@ namespace Telegram.Services.HotReactions
                                     _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
                                 }
                                 _database.SaveSyncState(currentState);
-                                onProgress?.Invoke("历史消息已全部扫描完毕", false);
+                                NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
                             }
                             else
                             {
-                                onProgress?.Invoke("历史数据同步停滞，可稍后点击继续", false);
+                                NotifyCrawlerProgress(chatId, "历史数据同步停滞，可稍后点击继续", false);
                             }
                             break;
                         }
@@ -387,7 +454,7 @@ namespace Telegram.Services.HotReactions
                             {
                                 currentState.ColdSyncCompleted = true;
                                 _database.SaveSyncState(currentState);
-                                onProgress?.Invoke("历史消息已全部扫描完毕", false);
+                                NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
                                 break;
                             }
 
@@ -395,12 +462,12 @@ namespace Telegram.Services.HotReactions
                             stallCount++;
                             if (stallCount < 4)
                             {
-                                onProgress?.Invoke($"历史深度数据拉取中 (重试 {stallCount}/4)...", true);
+                                NotifyCrawlerProgress(chatId, $"历史深度数据拉取中 (重试 {stallCount}/4)...", true);
                                 await Task.Delay(2000, token);
                                 continue;
                             }
 
-                            onProgress?.Invoke("历史数据拉取暂无进展，可稍后点击继续", false);
+                            NotifyCrawlerProgress(chatId, "历史数据拉取暂无进展，可稍后点击继续", false);
                             break;
                         }
 
@@ -412,7 +479,7 @@ namespace Telegram.Services.HotReactions
                         {
                             currentState.ColdSyncCompleted = true;
                             _database.SaveSyncState(currentState);
-                            onProgress?.Invoke("历史消息已全部扫描完毕", false);
+                            NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
                             break;
                         }
 
@@ -434,11 +501,11 @@ namespace Telegram.Services.HotReactions
                             long scannedSpan = Math.Max(0, now - oldestDateInBatch);
                             int pct = (int)Math.Clamp((scannedSpan * 100) / totalSpan, 0, 99);
                             string firstDateStr = DateTimeOffset.FromUnixTimeSeconds(currentState.EarliestMsgDate).ToLocalTime().ToString("yyyy/MM/dd");
-                            onProgress?.Invoke($"慢爬中：已扫描至 {dateStr} (起点: {firstDateStr} · 约 {pct}%) · 已收录 {totalSaved} 条", true);
+                            NotifyCrawlerProgress(chatId, $"慢爬中：已扫描至 {dateStr} (起点: {firstDateStr} · 约 {pct}%) · 已收录 {totalSaved} 条", true);
                         }
                         else
                         {
-                            onProgress?.Invoke($"慢爬中：已扫描至 {dateStr} (已收录 {totalSaved} 条)", true);
+                            NotifyCrawlerProgress(chatId, $"慢爬中：已扫描至 {dateStr} (已收录 {totalSaved} 条)", true);
                         }
 
                         await Task.Delay(2500, token);
@@ -446,17 +513,17 @@ namespace Telegram.Services.HotReactions
 
                     if (token.IsCancellationRequested)
                     {
-                        onProgress?.Invoke("慢爬已暂停", false);
+                        NotifyCrawlerProgress(chatId, "慢爬已暂停", false);
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    onProgress?.Invoke("慢爬已暂停", false);
+                    NotifyCrawlerProgress(chatId, "慢爬已暂停", false);
                 }
                 catch (Exception ex)
                 {
                     Logger.Exception(ex);
-                    onProgress?.Invoke("慢爬发生异常", false);
+                    NotifyCrawlerProgress(chatId, "慢爬发生异常", false);
                 }
                 finally
                 {
@@ -491,25 +558,12 @@ namespace Telegram.Services.HotReactions
 
         public void UpdateMessageReaction(long chatId, long messageId, MessageInteractionInfo interactionInfo)
         {
+            if (interactionInfo == null) return;
             var (count, emoji, reactionsJson) = ExtractReactions(interactionInfo);
-            var state = _database.GetSyncState(chatId);
+            if (count <= 0) return;
 
-            if (count >= state.EffectiveThreshold)
-            {
-                var existing = _database.GetTopMessages(chatId, 1, null, 1).FirstOrDefault(m => m.MessageId == messageId);
-                if (existing != null)
-                {
-                    existing.MaxReactionCount = count;
-                    existing.TopEmoji = emoji;
-                    existing.ReactionsJson = reactionsJson;
-                    _database.UpsertMessages(chatId, new[] { existing });
-                }
-            }
-            else
-            {
-                // If it fell below threshold and is cold, we can prune
-                _database.PruneColdMessages(chatId, state.EffectiveThreshold, DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 7 * 86400);
-            }
+            // 仅对库中已有条目更新其点赞数与表情，不进行全表扫描与每次剪枝，避免高并发锁冲突
+            _database.UpdateMessageReactionIfExists(chatId, messageId, count, emoji, reactionsJson);
         }
 
         private static (string Snippet, bool HasMedia) ExtractSnippet(MessageContent content)
