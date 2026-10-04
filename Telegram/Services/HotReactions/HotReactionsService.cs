@@ -12,134 +12,116 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
-using Telegram.Common;
 using Telegram.Td.Api;
 
 namespace Telegram.Services.HotReactions
 {
     public class HotReactionsService : IDisposable
     {
-        private static readonly Lazy<HotReactionsService> _current = new(() => new HotReactionsService(), System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
-        public static HotReactionsService Current => _current.Value;
-
-        private readonly HotReactionsDatabase _database;
-        private readonly ConcurrentDictionary<long, (CancellationTokenSource Cts, Task WorkerTask)> _crawlers = new();
-        private readonly ConcurrentDictionary<long, int> _crawlerEpochs = new();
-        private readonly ConcurrentDictionary<long, object> _chatLocks = new();
-        private readonly ConcurrentDictionary<long, Action<string, bool>> _progressCallbacks = new();
-        private readonly Channel<Action> _dbWriteChannel = Channel.CreateUnbounded<Action>(new UnboundedChannelOptions { SingleReader = true });
-
-        private object GetChatLock(long chatId) => _chatLocks.GetOrAdd(chatId, _ => new object());
-
-        private bool ExecuteIfEpochValid(long chatId, int expectedEpoch, Action action)
+        private sealed class Crawler
         {
-            lock (GetChatLock(chatId))
-            {
-                if (_crawlerEpochs.TryGetValue(chatId, out var ep) && ep == expectedEpoch)
-                {
-                    action();
-                    return true;
-                }
-                return false;
-            }
+            public CancellationTokenSource Cancellation;
+            public Task Task;
+            public Action<string, bool> Progress;
         }
+
+        private sealed class PendingUpdate
+        {
+            public bool Deleted;
+            public MessageInteractionInfo Reactions;
+        }
+
+        private readonly IClientService _clientService;
+        private readonly HotReactionsDatabase _database;
+        private readonly CancellationTokenSource _lifetime = new();
+        private readonly SemaphoreSlim _requestGate = new(1, 1);
+        private readonly TimeSpan _requestInterval;
+        private DateTimeOffset _nextRequest;
+        private readonly ConcurrentDictionary<long, Crawler> _crawlers = new();
+        private readonly ConcurrentDictionary<long, bool> _paused = new();
+        private readonly ConcurrentDictionary<long, int> _epochs = new();
+        private readonly ConcurrentDictionary<long, object> _chatLocks = new();
+        private readonly ConcurrentDictionary<long, SemaphoreSlim> _syncGates = new();
+        private readonly ConcurrentDictionary<(long ChatId, long MessageId), PendingUpdate> _pendingUpdates = new();
+        private readonly Channel<bool> _updateSignal = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
+        {
+            SingleReader = true,
+            FullMode = BoundedChannelFullMode.DropWrite
+        });
+        private readonly Task _initialization;
+        private readonly Task _updateWorker;
+        private readonly object _lifecycleLock = new();
+        private readonly HashSet<Task> _workers = new();
+        private Task _shutdown = Task.CompletedTask;
+        private volatile bool _disposed;
 
         public HotReactionsDatabase Database => _database;
+        public long UserId { get; }
+        private bool IsCurrentAccount => UserId == _clientService.Options.MyId;
+        public event Action<long> MessagesChanged;
+        public event Action<long, string, bool> CrawlerProgress;
 
-        public void SetCrawlerProgressCallback(long chatId, Action<string, bool> callback)
+        public HotReactionsService(IClientService clientService, Task previousShutdown)
+            : this(clientService, new HotReactionsDatabase(clientService.SessionId, clientService.Options.MyId), TimeSpan.FromSeconds(2.5), previousShutdown)
         {
-            if (callback != null)
-            {
-                _progressCallbacks[chatId] = callback;
-            }
-            else
-            {
-                _progressCallbacks.TryRemove(chatId, out _);
-            }
         }
 
-        private void NotifyCrawlerProgress(long chatId, string status, bool isRunning)
+        internal HotReactionsService(IClientService clientService, HotReactionsDatabase database, TimeSpan requestInterval, Task previousShutdown = null)
         {
-            if (_progressCallbacks.TryGetValue(chatId, out var callback))
+            _clientService = clientService;
+            UserId = clientService.Options.MyId;
+            if (UserId <= 0) throw new InvalidOperationException("排行榜需要已登录的账号");
+            _database = database;
+            _requestInterval = requestInterval;
+            _initialization = Task.Run(async () =>
             {
-                callback?.Invoke(status, isRunning);
-            }
+                if (previousShutdown != null) await previousShutdown;
+                _database.Initialize();
+            });
+            _updateWorker = Task.Run(ProcessUpdatesAsync);
         }
 
-        public HotReactionsService()
-        {
-            _database = new HotReactionsDatabase();
-            Task.Run(() => _database.Initialize());
-            Task.Run(ProcessDbWritesAsync);
-        }
+        public Task InitializeAsync() => _initialization;
+        private object ChatLock(long chatId) => _chatLocks.GetOrAdd(chatId, _ => new object());
+        private SemaphoreSlim SyncGate(long chatId) => _syncGates.GetOrAdd(chatId, _ => new SemaphoreSlim(1, 1));
+        private int Epoch(long chatId) => _epochs.GetOrAdd(chatId, 0);
+        public bool IsCrawlerPaused(long chatId) => _paused.TryGetValue(chatId, out var paused) && paused;
+        private bool IsPaused(long chatId) => IsCrawlerPaused(chatId);
 
-        private async Task ProcessDbWritesAsync()
+        private bool Commit(long chatId, int epoch, CancellationToken token, IReadOnlyList<HotMessageItem> messages,
+            Action<ChannelSyncState> advance, long cutoff)
         {
-            var reader = _dbWriteChannel.Reader;
-            while (await reader.WaitToReadAsync())
+            lock (ChatLock(chatId))
             {
-                while (reader.TryRead(out var action))
-                {
-                    try
-                    {
-                        action();
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Exception(ex);
-                    }
-                }
+                if (_disposed || !IsCurrentAccount || token.IsCancellationRequested || Epoch(chatId) != epoch) return false;
+                var revision = _database.GetRevision(chatId);
+                _database.CommitBatch(chatId, messages, advance, cutoff);
+                if (_database.GetRevision(chatId) != revision) RaiseMessagesChanged(chatId);
+                return true;
             }
         }
 
         public static (int TopCount, string TopEmoji, string ReactionsJson) ExtractReactions(MessageInteractionInfo info)
         {
-            if (info?.Reactions?.Reactions == null || info.Reactions.Reactions.Count == 0)
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            if (info?.Reactions?.Reactions != null)
             {
-                return (0, null, null);
-            }
-
-            var dict = new Dictionary<string, int>();
-            int maxCount = 0;
-            string topEmoji = "👍";
-
-            foreach (var r in info.Reactions.Reactions)
-            {
-                if (r == null || r.TotalCount <= 0) continue;
-
-                string emoji = "👍";
-                if (r.Type is ReactionTypeEmoji emojiType)
+                foreach (var reaction in info.Reactions.Reactions)
                 {
-                    emoji = emojiType.Emoji;
-                }
-                else if (r.Type is ReactionTypeCustomEmoji)
-                {
-                    emoji = "⭐";
-                }
-
-                if (dict.TryGetValue(emoji, out int current))
-                {
-                    dict[emoji] = current + r.TotalCount;
-                }
-                else
-                {
-                    dict[emoji] = r.TotalCount;
-                }
-
-                if (dict[emoji] > maxCount)
-                {
-                    maxCount = dict[emoji];
-                    topEmoji = emoji;
+                    if (reaction == null || reaction.TotalCount <= 0) continue;
+                    string key;
+                    if (reaction.Type is ReactionTypeEmoji emoji) key = emoji.Emoji;
+                    else if (reaction.Type is ReactionTypeCustomEmoji custom) key = ReactionSentimentService.CustomReactionPrefix + custom.CustomEmojiId;
+                    else if (reaction.Type is ReactionTypePaid) key = ReactionSentimentService.PaidReactionKey;
+                    else continue;
+                    if (string.IsNullOrEmpty(key)) continue;
+                    // A duplicate identity is still one reaction, never an additional sentiment bucket.
+                    counts[key] = Math.Max(counts.TryGetValue(key, out var count) ? count : 0, reaction.TotalCount);
                 }
             }
-
-            if (maxCount <= 0)
-            {
-                return (0, null, null);
-            }
-
-            string json = System.Text.Json.JsonSerializer.Serialize(dict);
-            return (maxCount, topEmoji, json);
+            if (counts.Count == 0) return (0, null, null);
+            var top = counts.OrderByDescending(x => x.Value).ThenBy(x => x.Key, StringComparer.Ordinal).First();
+            return (top.Value, top.Key, System.Text.Json.JsonSerializer.Serialize(counts));
         }
 
         public static (int Count, string Emoji) GetTopReaction(MessageInteractionInfo info)
@@ -148,621 +130,568 @@ namespace Telegram.Services.HotReactions
             return (count, emoji);
         }
 
-        public async Task<(long MsgId, long Date)> GetEarliestMessageAsync(IClientService clientService, long chatId)
+        internal static int FloodWaitSeconds(Error error)
         {
+            var message = error.Message ?? string.Empty;
+            if (message.StartsWith("FLOOD_WAIT_", StringComparison.Ordinal)
+                || message.StartsWith("FLOOD_PREMIUM_WAIT_", StringComparison.Ordinal))
+            {
+                var prefixLength = message.StartsWith("FLOOD_WAIT_", StringComparison.Ordinal) ? "FLOOD_WAIT_".Length : "FLOOD_PREMIUM_WAIT_".Length;
+                var value = message.Substring(prefixLength).Split('_')[0];
+                return int.TryParse(value, out var seconds) ? Math.Max(1, seconds) : 5;
+            }
+            const string retry = "retry after ";
+            var offset = message.IndexOf(retry, StringComparison.OrdinalIgnoreCase);
+            if (error.Code == 429 && offset >= 0 && int.TryParse(message.Substring(offset + retry.Length).Trim(), out var wait))
+            {
+                return Math.Max(1, wait);
+            }
+            return error.Code == 429 ? 5 : 0;
+        }
+
+        // The request gate stays owned by a late-reply observer until the native request completes.
+        private void DelayRequests(TimeSpan duration)
+        {
+            var until = DateTimeOffset.UtcNow + duration;
+            if (until > _nextRequest) _nextRequest = until;
+        }
+
+        private void RespectServerWait(Object response)
+        {
+            if (_disposed || response is not Error error) return;
+            var seconds = FloodWaitSeconds(error);
+            if (seconds > 0) DelayRequests(TimeSpan.FromSeconds(seconds));
+        }
+
+        private async Task<Object> GetHistoryAsync(long chatId, long fromId, int offset, int limit, CancellationToken token)
+        {
+            await _requestGate.WaitAsync(token);
+            bool releaseGate = true;
             try
             {
-                var response = await clientService.SendAsync(new GetChatHistory(chatId, 1, -1, 1, false));
-                if (response is Messages messages && messages.MessagesValue.Count > 0)
+                while (true)
                 {
-                    var firstMsg = messages.MessagesValue[0];
-                    return (firstMsg.Id, firstMsg.Date);
+                    var remaining = _nextRequest - DateTimeOffset.UtcNow;
+                    if (remaining <= TimeSpan.Zero) break;
+                    await Task.Delay(remaining > TimeSpan.FromDays(1) ? TimeSpan.FromDays(1) : remaining, token);
                 }
+                token.ThrowIfCancellationRequested();
+                if (!IsCurrentAccount) throw new InvalidOperationException("排行榜账号已切换");
+                DelayRequests(_requestInterval);
+                var send = _clientService.SendAsync(new GetChatHistory(chatId, fromId, offset, limit, false));
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+                var delay = Task.Delay(TimeSpan.FromSeconds(30), timeout.Token);
+                if (await Task.WhenAny(send, delay) != send)
+                {
+                    // TDLib cannot cancel the native request. Keep its account slot until the reply arrives,
+                    // honor late rate limits, and never commit that reply into a canceled scan.
+                    releaseGate = false;
+                    _ = send.ContinueWith(task =>
+                    {
+                        try
+                        {
+                            if (task.IsFaulted) Logger.Exception(task.Exception);
+                            else if (task.Status == TaskStatus.RanToCompletion) RespectServerWait(task.Result);
+                        }
+                        finally { _requestGate.Release(); }
+                    }, TaskContinuationOptions.ExecuteSynchronously);
+                    token.ThrowIfCancellationRequested();
+                    throw new TimeoutException("历史请求超时，请稍后继续同步");
+                }
+                timeout.Cancel();
+                var response = await send;
+                RespectServerWait(response);
+                return response;
             }
-            catch (Exception ex)
+            finally
             {
-                Logger.Exception(ex);
+                if (releaseGate) _requestGate.Release();
+            }
+        }
+
+        private async Task<(long MsgId, long Date)> EarliestAsync(long chatId, CancellationToken token)
+        {
+            var response = await GetHistoryAsync(chatId, 1, -1, 1, token);
+            if (response is Messages messages && messages.MessagesValue.Count > 0)
+            {
+                var message = messages.MessagesValue[messages.MessagesValue.Count - 1];
+                return (message.Id, message.Date);
             }
             return (0, 0);
         }
 
-        public async Task<List<HotMessageItem>> SyncHotWindowAsync(IClientService clientService, long chatId, Action<string> progressCallback = null)
+        public Task<List<HotMessageItem>> SyncHotWindowAsync(IClientService clientService, long chatId,
+            Action<string> progressCallback = null, CancellationToken token = default)
         {
-            // 为避免同一个 Chat 的 GetChatHistory 请求在 TDLib 内部发生并发冲突或排队挂起，
-            // 若后台慢爬正在运行，先暂时停止
-            bool crawlerWasRunning = IsCrawlerRunning(chatId);
-            if (crawlerWasRunning)
+            lock (_lifecycleLock)
             {
-                StopColdCrawler(chatId);
+                if (_disposed) throw new ObjectDisposedException(nameof(HotReactionsService));
+                var task = Task.Run(() => SyncHotWindowCoreAsync(clientService, chatId, progressCallback, token));
+                TrackWorker(task);
+                return task;
             }
+        }
 
-            int currentEpoch = _crawlerEpochs.GetOrAdd(chatId, 1);
+        private void TrackWorker(Task task)
+        {
+            _workers.Add(task);
+            _ = task.ContinueWith(completed =>
+            {
+                lock (_lifecycleLock) _workers.Remove(completed);
+            }, TaskContinuationOptions.ExecuteSynchronously);
+        }
 
+        private async Task<List<HotMessageItem>> SyncHotWindowCoreAsync(IClientService clientService, long chatId,
+            Action<string> progressCallback, CancellationToken token)
+        {
+            if (clientService != _clientService) throw new ArgumentException("Wrong account", nameof(clientService));
+            await _initialization;
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token, _lifetime.Token);
+            deadline.CancelAfter(TimeSpan.FromSeconds(10));
+            var cancellation = deadline.Token;
+            var gate = SyncGate(chatId);
+            var acquired = false;
+            var epoch = Epoch(chatId);
             try
             {
-                return await Task.Run(async () =>
+                await StopCrawler(chatId, false);
+                await gate.WaitAsync(cancellation);
+                acquired = true;
+                if (!Commit(chatId, epoch, cancellation, Array.Empty<HotMessageItem>(), null,
+                    DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 7 * 86400)) return new List<HotMessageItem>();
+                var state = _database.GetSyncState(chatId);
+                long fromId = 0;
+                long newestId = 0;
+                long stopId = state.NewestSyncedMsgId;
+                var cutoff = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 7 * 86400;
+                int fetched = 0;
+                progressCallback?.Invoke("正在同步近7天消息...");
+                while (fetched < 500)
                 {
-                    var state = _database.GetSyncState(chatId);
-                    var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    var sevenDaysAgo = now - (7 * 86400);
-
-                    var itemsToSave = new List<HotMessageItem>();
-                    long fromMessageId = 0;
-                    int totalFetched = 0;
-                    bool reachedEnd = false;
-
-                    progressCallback?.Invoke("正在同步近7天消息...");
-
-                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-
-                    while (totalFetched < 500 && !reachedEnd && !timeoutCts.IsCancellationRequested)
+                    var response = await GetHistoryAsync(chatId, fromId, 0, 100, cancellation);
+                    if (response is not Messages messages || messages.MessagesValue.Count == 0) break;
+                    var oldest = messages.MessagesValue.Min(x => x.Id);
+                    if (oldest <= 0 || (fromId != 0 && oldest >= fromId)) break;
+                    if (newestId == 0) newestId = messages.MessagesValue.Max(x => x.Id);
+                    var items = CreateItems(chatId, messages, cutoff);
+                    bool finished = messages.MessagesValue.Any(x => x.Date < cutoff && (stopId == 0 || x.Id <= stopId));
+                    if (!Commit(chatId, epoch, cancellation, items, current =>
                     {
-                        var sendTask = clientService.SendAsync(new GetChatHistory(chatId, fromMessageId, 0, 100, false));
-                        var completed = await Task.WhenAny(sendTask, Task.Delay(4000, timeoutCts.Token));
-
-                        if (completed != sendTask)
+                        AdvanceOldest(current, oldest);
+                        current.PendingSyncFromId = finished ? 0 : oldest;
+                        current.PendingSyncNewestId = finished ? 0 : newestId;
+                        current.PendingSyncStopId = finished ? 0 : stopId;
+                        if (finished)
                         {
-                            // 单次请求超时（4秒），防止 TDLib 内部死锁或无响应
-                            break;
+                            current.NewestSyncedMsgId = Math.Max(current.NewestSyncedMsgId, newestId);
+                            current.LastHotSync = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                         }
-
-                        var response = await sendTask;
-                        if (response is not Messages messages || messages.MessagesValue.Count == 0)
-                        {
-                            reachedEnd = true;
-                            break;
-                        }
-
-                        long oldestInBatch = fromMessageId;
-
-                        foreach (var msg in messages.MessagesValue)
-                        {
-                            totalFetched++;
-                            oldestInBatch = msg.Id;
-
-                            if (msg.Date < sevenDaysAgo)
-                            {
-                                reachedEnd = true;
-                            }
-
-                            var (count, emoji, reactionsJson) = ExtractReactions(msg.InteractionInfo);
-                            if (count > 0 && state.SampleCount < 50)
-                            {
-                                state.SampleCount++;
-                                state.SampleSum += count;
-                                if (state.SampleCount == 50)
-                                {
-                                    double avg = (double)state.SampleSum / state.SampleCount;
-                                    state.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
-                                }
-                            }
-
-                            if (count > 0)
-                            {
-                                var (snippet, hasMedia) = ExtractSnippet(msg.Content);
-                                itemsToSave.Add(new HotMessageItem
-                                {
-                                    ChatId = chatId,
-                                    MessageId = msg.Id,
-                                    Date = msg.Date,
-                                    MaxReactionCount = count,
-                                    TopEmoji = emoji,
-                                    ReactionsJson = reactionsJson,
-                                    Snippet = snippet,
-                                    SenderName = GetSenderDisplayName(clientService, msg.SenderId),
-                                    HasMedia = hasMedia,
-                                    IsCold = msg.Date < sevenDaysAgo
-                                });
-                            }
-                        }
-
-                        // 关键防停滞/历史触底检测：
-                        // 当频道历史到头时，TDLib 不会返回空列表，而是返回包含起点自身的单条记录
-                        if (oldestInBatch == fromMessageId && fromMessageId != 0)
-                        {
-                            reachedEnd = true;
-                            break;
-                        }
-
-                        fromMessageId = oldestInBatch;
-                    }
-
-                    bool writeOk = ExecuteIfEpochValid(chatId, currentEpoch, () =>
-                    {
-                        if (itemsToSave.Count > 0)
-                        {
-                            _database.UpsertMessages(chatId, itemsToSave);
-                        }
-
-                        _database.FreezeMessagesOlderThan(chatId, sevenDaysAgo);
-                        _database.PruneColdMessages(chatId, state.EffectiveThreshold, sevenDaysAgo);
-
-                        state.LastHotSync = now;
-                        if (state.NewestSyncedMsgId == 0 && itemsToSave.Count > 0)
-                        {
-                            state.NewestSyncedMsgId = itemsToSave[0].MessageId;
-                        }
-                        if (state.OldestSyncedMsgId == 0 && fromMessageId != 0)
-                        {
-                            state.OldestSyncedMsgId = fromMessageId;
-                        }
-
-                        _database.SaveSyncState(state);
-                    });
-
-                    if (!writeOk)
-                    {
-                        return new List<HotMessageItem>();
-                    }
-
-                    return _database.GetTopMessages(chatId, 100, null, state.EffectiveThreshold);
-                });
+                    }, cutoff)) break;
+                    fetched += messages.MessagesValue.Count;
+                    fromId = oldest;
+                    if (finished) break;
+                }
             }
-            catch (Exception ex)
+            catch (OperationCanceledException) when (!token.IsCancellationRequested && !_lifetime.IsCancellationRequested)
             {
-                Logger.Exception(ex);
-                return await Task.Run(() => _database.GetTopMessages(chatId, 100, null, 1));
+                progressCallback?.Invoke("快速同步预算已用完，剩余消息将在后台补全");
             }
+            catch (TimeoutException ex)
+            {
+                progressCallback?.Invoke(ex.Message);
+            }
+            finally
+            {
+                if (acquired) gate.Release();
+                if (!_disposed && IsCurrentAccount && !IsPaused(chatId) && Epoch(chatId) == epoch)
+                {
+                    StartColdCrawler(_clientService, chatId);
+                }
+            }
+            token.ThrowIfCancellationRequested();
+            return await Task.Run(() => _database.GetTopMessages(chatId, 100, null, _database.GetSyncState(chatId).EffectiveThreshold, token: token), token);
+        }
+
+        private static void AdvanceOldest(ChannelSyncState state, long oldest)
+        {
+            if (state.OldestSyncedMsgId == 0 || oldest < state.OldestSyncedMsgId) state.OldestSyncedMsgId = oldest;
+        }
+
+        private static void FinishPending(ChannelSyncState state)
+        {
+            state.NewestSyncedMsgId = Math.Max(state.NewestSyncedMsgId, state.PendingSyncNewestId);
+            state.PendingSyncFromId = 0;
+            state.PendingSyncNewestId = 0;
+            state.PendingSyncStopId = 0;
+            state.LastHotSync = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         }
 
         public bool IsCrawlerRunning(long chatId)
         {
-            return _crawlers.TryGetValue(chatId, out var pair) && !pair.Cts.IsCancellationRequested;
+            return _crawlers.TryGetValue(chatId, out var crawler) && !crawler.Cancellation.IsCancellationRequested;
         }
 
-        public Task StopColdCrawler(long chatId)
-        {
-            _crawlerEpochs.AddOrUpdate(chatId, 1, (_, v) => v + 1);
+        public Task StopColdCrawler(long chatId) => StopCrawler(chatId, true);
 
-            if (_crawlers.TryRemove(chatId, out var pair))
+        private Task StopCrawler(long chatId, bool pause)
+        {
+            lock (ChatLock(chatId))
             {
-                try
+                if (pause) _paused[chatId] = true;
+                if (!_crawlers.TryRemove(chatId, out var crawler)) return Task.CompletedTask;
+                crawler.Cancellation.Cancel();
+                return crawler.Task ?? Task.CompletedTask;
+            }
+        }
+
+        public void StartColdCrawler(IClientService clientService, long chatId, Action<string, bool> onProgress = null)
+        {
+            if (clientService != _clientService) throw new ArgumentException("Wrong account", nameof(clientService));
+            lock (_lifecycleLock)
+            lock (ChatLock(chatId))
+            {
+                if (_disposed) return;
+                _paused[chatId] = false;
+                if (_crawlers.TryGetValue(chatId, out var running))
                 {
-                    pair.Cts.Cancel();
+                    if (onProgress != null) running.Progress = onProgress;
+                    return;
                 }
-                catch { }
-                return pair.WorkerTask;
+                var crawler = new Crawler
+                {
+                    Cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token),
+                    Progress = onProgress
+                };
+                var epoch = Epoch(chatId);
+                _crawlers[chatId] = crawler;
+                crawler.Task = Task.Run(() => RunCrawlerAsync(chatId, epoch, crawler));
+                TrackWorker(crawler.Task);
             }
-            return Task.CompletedTask;
         }
 
-        public void StartColdCrawler(IClientService clientService, long chatId, Action<string, bool> onProgress, bool forceResume = false)
+        private void Progress(long chatId, Crawler crawler, string status, bool running)
         {
-            StopColdCrawler(chatId);
-
-            if (onProgress != null)
+            if (!_crawlers.TryGetValue(chatId, out var current) || current != crawler) return;
+            try
             {
-                SetCrawlerProgressCallback(chatId, onProgress);
+                crawler.Progress?.Invoke(status, running);
+                CrawlerProgress?.Invoke(chatId, status, running);
             }
+            catch (Exception ex) { Logger.Exception(ex); }
+        }
 
-            int currentEpoch = _crawlerEpochs.AddOrUpdate(chatId, 1, (_, v) => v + 1);
-            var cts = new CancellationTokenSource();
-
-            var workerTask = Task.Run(async () =>
+        private async Task RunCrawlerAsync(long chatId, int epoch, Crawler crawler)
+        {
+            var token = crawler.Cancellation.Token;
+            var gate = SyncGate(chatId);
+            int stalls = 0;
+            int errors = 0;
+            try
             {
-                var token = cts.Token;
-                var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                var sevenDaysAgo = now - (7 * 86400);
-                int consecutiveErrors = 0;
-                int stallCount = 0;
-
-                try
+                await _initialization;
+                while (!token.IsCancellationRequested)
                 {
-                    if (token.IsCancellationRequested || (_crawlerEpochs.TryGetValue(chatId, out var ep0) && ep0 != currentEpoch))
+                    await gate.WaitAsync(token);
+                    try
                     {
-                        return;
-                    }
-
-                    var state = _database.GetSyncState(chatId);
-                    if (forceResume && state.ColdSyncCompleted)
-                    {
-                        state.ColdSyncCompleted = false;
-                        ExecuteIfEpochValid(chatId, currentEpoch, () => _database.SaveSyncState(state));
-                    }
-
-                    if (state.ColdSyncCompleted)
-                    {
-                        NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
-                        return;
-                    }
-
-                    // 探针获取频道的最初消息时间与 ID，辅助裁定慢爬是否真正到达历史原点
-                    var initState = _database.GetSyncState(chatId);
-                    if (initState.EarliestMsgDate == 0)
-                    {
-                        var (earliestId, earliestDate) = await GetEarliestMessageAsync(clientService, chatId);
-                        if (earliestDate > 0)
+                        var cutoff = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 7 * 86400;
+                        if (!_database.IsIndexed(chatId) && !Commit(chatId, epoch, token, Array.Empty<HotMessageItem>(), null, cutoff)) return;
+                        var state = _database.GetSyncState(chatId);
+                        if (state.EarliestMsgId == 0 || stalls >= 3)
                         {
-                            if (token.IsCancellationRequested)
+                            var (earliestId, date) = await EarliestAsync(chatId, token);
+                            if (earliestId > 0)
                             {
-                                return;
-                            }
-                            initState.EarliestMsgId = earliestId;
-                            initState.EarliestMsgDate = earliestDate;
-                            if (!ExecuteIfEpochValid(chatId, currentEpoch, () => _database.SaveSyncState(initState)))
-                            {
-                                return;
-                            }
-                        }
-                    }
-
-                    while (!token.IsCancellationRequested)
-                    {
-                        var currentState = _database.GetSyncState(chatId);
-                        if (currentState.ColdSyncCompleted)
-                        {
-                            NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
-                            break;
-                        }
-
-                        long fromId = currentState.OldestSyncedMsgId;
-                        var response = await clientService.SendAsync(new GetChatHistory(chatId, fromId, 0, 100, false));
-
-                        if (token.IsCancellationRequested)
-                        {
-                            break;
-                        }
-
-                        if (response is Telegram.Td.Api.Error error)
-                        {
-                            consecutiveErrors++;
-                            if (error.Message.StartsWith("FLOOD_WAIT"))
-                            {
-                                int delay = 5;
-                                var parts = error.Message.Split('_');
-                                if (parts.Length > 2 && int.TryParse(parts[2], out int waitSec))
+                                if (!Commit(chatId, epoch, token, Array.Empty<HotMessageItem>(), current =>
                                 {
-                                    delay = Math.Clamp(waitSec, 2, 60);
-                                }
-                                NotifyCrawlerProgress(chatId, $"触发限流，等待 {delay} 秒后重试...", true);
-                                await Task.Delay(delay * 1000, token);
+                                    current.EarliestMsgId = earliestId;
+                                    current.EarliestMsgDate = date;
+                                }, cutoff)) return;
+                                state = _database.GetSyncState(chatId);
+                            }
+                        }
+                        bool pending = state.PendingSyncFromId > 0;
+                        long fromId = pending ? state.PendingSyncFromId : state.OldestSyncedMsgId;
+                        if (state.EarliestMsgId > 0 && fromId > 0 && fromId <= state.EarliestMsgId)
+                        {
+                            if (!Commit(chatId, epoch, token, Array.Empty<HotMessageItem>(), current =>
+                            {
+                                if (pending) FinishPending(current);
+                                current.ColdSyncCompleted = true;
+                            }, cutoff)) return;
+                            Progress(chatId, crawler, "历史消息已全部扫描完毕", false);
+                            return;
+                        }
+                        if (!pending && state.ColdSyncCompleted)
+                        {
+                            Progress(chatId, crawler, "历史消息已全部扫描完毕", false);
+                            return;
+                        }
+                        var response = await GetHistoryAsync(chatId, fromId, 0, 100, token);
+                        if (response is Error error)
+                        {
+                            var wait = FloodWaitSeconds(error);
+                            if (wait > 0)
+                            {
+                                Progress(chatId, crawler, $"触发限流，账号暂停请求 {wait} 秒...", true);
                                 continue;
                             }
-
-                            if (consecutiveErrors >= 3)
+                            if (++errors >= 3)
                             {
-                                NotifyCrawlerProgress(chatId, $"慢爬网络暂停：{error.Message}", false);
-                                break;
+                                Progress(chatId, crawler, $"同步已暂停：{error.Message}", false);
+                                return;
                             }
-
                             await Task.Delay(3000, token);
                             continue;
                         }
-
-                        consecutiveErrors = 0;
-
-                        // 检查是否返回空批次
-                        if (response is not Messages messages || messages.MessagesValue.Count == 0)
+                        errors = 0;
+                        var batch = response as Messages;
+                        var oldest = batch?.MessagesValue.Count > 0 ? batch.MessagesValue.Min(x => x.Id) : 0;
+                        if (oldest <= 0 || (fromId != 0 && oldest >= fromId))
                         {
-                            // 如果还未确认到达历史起点，说明 TDLib 正在远端加载数据，进行等待重试
-                            if (stallCount < 4)
+                            if (++stalls > 3)
                             {
-                                stallCount++;
-                                NotifyCrawlerProgress(chatId, $"正在同步历史深处数据 (重试 {stallCount}/4)...", true);
-                                await Task.Delay(2000, token);
-                                continue;
+                                Progress(chatId, crawler, "历史同步暂无进展，请稍后继续；未标记完成", false);
+                                return;
                             }
-
-                            // 连续重试 4 次依然为空，若确认已在起点附近，则标记完成；否则暂停待续
-                            if (fromId == 0 || (currentState.EarliestMsgId > 0 && fromId <= currentState.EarliestMsgId))
-                            {
-                                currentState.ColdSyncCompleted = true;
-                                bool writeOk = ExecuteIfEpochValid(chatId, currentEpoch, () =>
-                                {
-                                    if (currentState.SampleCount > 0 && currentState.SampleCount < 50)
-                                    {
-                                        double avg = (double)currentState.SampleSum / currentState.SampleCount;
-                                        currentState.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
-                                        _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
-                                    }
-                                    _database.SaveSyncState(currentState);
-                                });
-                                if (writeOk)
-                                {
-                                    NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
-                                }
-                            }
-                            else
-                            {
-                                NotifyCrawlerProgress(chatId, "历史数据同步停滞，可稍后点击继续", false);
-                            }
-                            break;
+                            Progress(chatId, crawler, $"正在确认历史边界 ({stalls}/3)...", true);
+                            await Task.Delay(2000, token);
+                            continue;
                         }
-
-                        var coldItems = new List<HotMessageItem>();
-                        long oldestInBatch = fromId;
-                        long oldestDateInBatch = 0;
-
-                        foreach (var msg in messages.MessagesValue)
+                        stalls = 0;
+                        var items = CreateItems(chatId, batch, cutoff);
+                        bool pendingFinished = pending && batch.MessagesValue.Any(x => x.Date < cutoff && (state.PendingSyncStopId == 0 || x.Id <= state.PendingSyncStopId));
+                        bool reachedStart = state.EarliestMsgId > 0 && oldest <= state.EarliestMsgId;
+                        var newest = batch.MessagesValue.Max(x => x.Id);
+                        if (!Commit(chatId, epoch, token, items, current =>
                         {
-                            oldestInBatch = msg.Id;
-                            oldestDateInBatch = msg.Date;
-
-                            var (count, emoji, reactionsJson) = ExtractReactions(msg.InteractionInfo);
-                            if (count > 0 && currentState.SampleCount < 50)
+                            AdvanceOldest(current, oldest);
+                            if (!pending && fromId == 0 && current.NewestSyncedMsgId == 0) current.NewestSyncedMsgId = newest;
+                            if (pending)
                             {
-                                currentState.SampleCount++;
-                                currentState.SampleSum += count;
-                                if (currentState.SampleCount == 50)
-                                {
-                                    double avg = (double)currentState.SampleSum / currentState.SampleCount;
-                                    currentState.ComputedThreshold = Math.Max(1, (int)Math.Floor(avg * 0.9));
-                                    ExecuteIfEpochValid(chatId, currentEpoch, () =>
-                                    {
-                                        _database.PruneColdMessages(chatId, currentState.EffectiveThreshold, sevenDaysAgo);
-                                    });
-                                }
+                                if (pendingFinished || reachedStart) FinishPending(current);
+                                else current.PendingSyncFromId = oldest;
                             }
-
-                            if (count >= currentState.EffectiveThreshold)
-                            {
-                                var (snippet, hasMedia) = ExtractSnippet(msg.Content);
-                                coldItems.Add(new HotMessageItem
-                                {
-                                    ChatId = chatId,
-                                    MessageId = msg.Id,
-                                    Date = msg.Date,
-                                    MaxReactionCount = count,
-                                    TopEmoji = emoji,
-                                    ReactionsJson = reactionsJson,
-                                    Snippet = snippet,
-                                    SenderName = GetSenderDisplayName(clientService, msg.SenderId),
-                                    HasMedia = hasMedia,
-                                    IsCold = true
-                                });
-                            }
-                        }
-
-                        bool reachedStart = (currentState.EarliestMsgId > 0 && oldestInBatch <= currentState.EarliestMsgId) ||
-                                            (currentState.EarliestMsgDate > 0 && oldestDateInBatch > 0 && oldestDateInBatch <= currentState.EarliestMsgDate);
-
-                        // 若 ID 未推进
-                        if (oldestInBatch == fromId && fromId != 0)
-                        {
-                            if (reachedStart)
-                            {
-                                currentState.ColdSyncCompleted = true;
-                                if (ExecuteIfEpochValid(chatId, currentEpoch, () => _database.SaveSyncState(currentState)))
-                                {
-                                    NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
-                                }
-                                break;
-                            }
-
-                            // 未到起点却未推进：TDLib 本地未命中，正在向云端拉取，等待重试
-                            stallCount++;
-                            if (stallCount < 4)
-                            {
-                                NotifyCrawlerProgress(chatId, $"历史深度数据拉取中 (重试 {stallCount}/4)...", true);
-                                await Task.Delay(2000, token);
-                                continue;
-                            }
-
-                            NotifyCrawlerProgress(chatId, "历史数据拉取暂无进展，可稍后点击继续", false);
-                            break;
-                        }
-
-                        // 正常推进
-                        stallCount = 0;
-                        currentState.OldestSyncedMsgId = oldestInBatch;
-
+                            if (reachedStart) current.ColdSyncCompleted = true;
+                        }, cutoff)) return;
                         if (reachedStart)
                         {
-                            currentState.ColdSyncCompleted = true;
+                            Progress(chatId, crawler, "历史消息已全部扫描完毕", false);
+                            return;
                         }
-
-                        bool writeSuccess = ExecuteIfEpochValid(chatId, currentEpoch, () =>
+                        var scannedDate = batch.MessagesValue.Last().Date;
+                        var dateText = DateTimeOffset.FromUnixTimeSeconds(scannedDate).ToLocalTime().ToString("yyyy/MM/dd");
+                        var origin = string.Empty;
+                        if (state.EarliestMsgDate > 0)
                         {
-                            if (coldItems.Count > 0)
-                            {
-                                _database.UpsertMessages(chatId, coldItems);
-                            }
-                            _database.SaveSyncState(currentState);
-                        });
-
-                        if (!writeSuccess || token.IsCancellationRequested)
-                        {
-                            break;
+                            var span = Math.Max(1, DateTimeOffset.UtcNow.ToUnixTimeSeconds() - state.EarliestMsgDate);
+                            var percent = Math.Max(0, Math.Min(99, 100.0 * (DateTimeOffset.UtcNow.ToUnixTimeSeconds() - scannedDate) / span));
+                            var start = DateTimeOffset.FromUnixTimeSeconds(state.EarliestMsgDate).ToLocalTime().ToString("yyyy/MM/dd");
+                            origin = $" (起点: {start} · 约 {percent:F0}%)";
                         }
-
-                        if (reachedStart)
-                        {
-                            NotifyCrawlerProgress(chatId, "历史消息已全部扫描完毕", false);
-                            break;
-                        }
-
-                        if (token.IsCancellationRequested)
-                        {
-                            break;
-                        }
-
-                        int totalSaved = _database.GetTotalHotCount(chatId);
-                        string dateStr = oldestDateInBatch > 0
-                            ? DateTimeOffset.FromUnixTimeSeconds(oldestDateInBatch).ToLocalTime().ToString("yyyy/MM/dd")
-                            : string.Empty;
-
-                        if (currentState.EarliestMsgDate > 0 && oldestDateInBatch > 0 && now > currentState.EarliestMsgDate)
-                        {
-                            long totalSpan = Math.Max(1, now - currentState.EarliestMsgDate);
-                            long scannedSpan = Math.Max(0, now - oldestDateInBatch);
-                            int pct = (int)Math.Clamp((scannedSpan * 100) / totalSpan, 0, 99);
-                            string firstDateStr = DateTimeOffset.FromUnixTimeSeconds(currentState.EarliestMsgDate).ToLocalTime().ToString("yyyy/MM/dd");
-                            NotifyCrawlerProgress(chatId, $"慢爬中：已扫描至 {dateStr} (起点: {firstDateStr} · 约 {pct}%) · 已收录 {totalSaved} 条", true);
-                        }
-                        else
-                        {
-                            NotifyCrawlerProgress(chatId, $"慢爬中：已扫描至 {dateStr} (已收录 {totalSaved} 条)", true);
-                        }
-
-                        await Task.Delay(2500, token);
+                        var saved = _database.GetTotalHotCount(chatId);
+                        Progress(chatId, crawler, $"{(pending ? "补全近期消息" : "慢爬中")}：已扫描至 {dateText}{origin} · 已收录 {saved} 条", true);
                     }
-
-                    if (token.IsCancellationRequested)
+                    finally
                     {
-                        NotifyCrawlerProgress(chatId, "慢爬已暂停", false);
+                        gate.Release();
                     }
                 }
-                catch (OperationCanceledException)
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                Logger.Exception(ex);
+                Progress(chatId, crawler, "同步异常，游标未跳过失败批次，可稍后继续", false);
+            }
+            finally
+            {
+                lock (ChatLock(chatId))
                 {
-                    NotifyCrawlerProgress(chatId, "慢爬已暂停", false);
+                    if (_crawlers.TryGetValue(chatId, out var current) && current == crawler) _crawlers.TryRemove(chatId, out _);
                 }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                    NotifyCrawlerProgress(chatId, "慢爬发生异常", false);
-                }
-                finally
-                {
-                    if (_crawlers.TryGetValue(chatId, out var existing) && existing.Cts == cts)
-                    {
-                        _crawlers.TryRemove(chatId, out _);
-                    }
-                    try
-                    {
-                        cts.Dispose();
-                    }
-                    catch { }
-                }
-            }, cts.Token);
-
-            _crawlers[chatId] = (cts, workerTask);
+                crawler.Cancellation.Dispose();
+            }
         }
 
         public async Task ResetChannelSyncAsync(long chatId)
         {
-            var task = StopColdCrawler(chatId);
-            if (task != null && !task.IsCompleted)
+            var stopped = StopCrawler(chatId, true);
+            lock (ChatLock(chatId))
             {
-                try
-                {
-                    await Task.WhenAny(task, Task.Delay(1000));
-                }
-                catch { }
+                _epochs.AddOrUpdate(chatId, 1, (_, epoch) => epoch + 1);
             }
-
+            await stopped;
+            await _initialization;
             await Task.Run(() =>
             {
-                lock (GetChatLock(chatId))
+                lock (ChatLock(chatId))
                 {
-                    _crawlerEpochs.AddOrUpdate(chatId, 1, (_, v) => v + 1);
                     _database.ResetSyncState(chatId);
+                    RaiseMessagesChanged(chatId);
                 }
             });
         }
 
-        public void ResetChannelSync(long chatId)
+        public bool SetUserCustomThreshold(long chatId, int? threshold, bool rescanConfirmed = false)
         {
-            StopColdCrawler(chatId);
-            lock (GetChatLock(chatId))
+            lock (ChatLock(chatId))
             {
-                _crawlerEpochs.AddOrUpdate(chatId, 1, (_, v) => v + 1);
-                _database.ResetSyncState(chatId);
+                if (!_database.SetCustomThreshold(chatId, threshold, rescanConfirmed)) return false;
+                RaiseMessagesChanged(chatId);
+                return true;
             }
-        }
-
-        public void SetUserCustomThreshold(long chatId, int? threshold)
-        {
-            var state = _database.GetSyncState(chatId);
-            state.CustomThreshold = threshold;
-            _database.SaveSyncState(state);
-
-            var sevenDaysAgo = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (7 * 86400);
-            _database.PruneColdMessages(chatId, state.EffectiveThreshold, sevenDaysAgo);
         }
 
         public void UpdateMessageReaction(long chatId, long messageId, MessageInteractionInfo interactionInfo)
         {
-            if (interactionInfo == null) return;
-            var (count, emoji, reactionsJson) = ExtractReactions(interactionInfo);
-            if (count <= 0) return;
-
-            // 投递至单消费者无界通道，严格保序并绝不阻塞 TDLib 专有的 TdReceive 接收工作线程
-            _dbWriteChannel.Writer.TryWrite(() =>
-            {
-                _database.UpdateMessageReactionIfExists(chatId, messageId, count, emoji, reactionsJson);
-            });
+            if (_disposed || interactionInfo == null) return;
+            QueueUpdate(chatId, messageId, new PendingUpdate { Reactions = interactionInfo });
         }
 
         public void MarkMessagesDeleted(long chatId, IEnumerable<long> messageIds)
         {
-            if (messageIds == null) return;
-            var copy = messageIds.ToArray();
-            _dbWriteChannel.Writer.TryWrite(() =>
+            if (_disposed || messageIds == null) return;
+            foreach (var messageId in messageIds) QueueUpdate(chatId, messageId, new PendingUpdate { Deleted = true });
+        }
+
+        private void QueueUpdate(long chatId, long messageId, PendingUpdate update)
+        {
+            if (!IsCurrentAccount) return;
+            _pendingUpdates.AddOrUpdate((chatId, messageId), update, (_, previous) => previous.Deleted ? previous : update);
+            _updateSignal.Writer.TryWrite(true);
+        }
+
+        private async Task ProcessUpdatesAsync()
+        {
+            try
             {
-                foreach (var id in copy)
+                await _initialization;
+                while (await _updateSignal.Reader.WaitToReadAsync(_lifetime.Token))
                 {
-                    _database.MarkMessageDeleted(chatId, id);
+                    while (_updateSignal.Reader.TryRead(out _)) { }
+                    foreach (var group in _pendingUpdates.ToArray().GroupBy(x => x.Key.ChatId))
+                    {
+                        var pending = new List<KeyValuePair<(long ChatId, long MessageId), PendingUpdate>>();
+                        foreach (var pair in group)
+                        {
+                            if (((ICollection<KeyValuePair<(long ChatId, long MessageId), PendingUpdate>>)_pendingUpdates).Remove(pair)) pending.Add(pair);
+                        }
+                        if (!IsCurrentAccount || !_database.IsIndexed(group.Key)) continue;
+                        try
+                        {
+                            var deleted = new List<long>();
+                            var reactions = new List<(long, int, string, string)>();
+                            foreach (var pair in pending)
+                            {
+                                if (pair.Value.Deleted) deleted.Add(pair.Key.MessageId);
+                                else
+                                {
+                                    var (count, emoji, json) = ExtractReactions(pair.Value.Reactions);
+                                    reactions.Add((pair.Key.MessageId, count, emoji, json));
+                                }
+                            }
+                            lock (ChatLock(group.Key))
+                            {
+                                if (_disposed) return;
+                                var revision = _database.GetRevision(group.Key);
+                                _database.ApplyUpdates(group.Key, deleted, reactions);
+                                if (_database.GetRevision(group.Key) != revision) RaiseMessagesChanged(group.Key);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Exception(ex);
+                            foreach (var pair in pending)
+                            {
+                                if (pair.Value.Deleted) QueueUpdate(pair.Key.ChatId, pair.Key.MessageId, pair.Value);
+                                else _pendingUpdates.TryAdd(pair.Key, pair.Value);
+                            }
+                            _updateSignal.Writer.TryWrite(true);
+                            await Task.Delay(3000, _lifetime.Token);
+                        }
+                    }
                 }
-            });
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { Logger.Exception(ex); }
+        }
+
+        private void RaiseMessagesChanged(long chatId)
+        {
+            try { MessagesChanged?.Invoke(chatId); }
+            catch (Exception ex) { Logger.Exception(ex); }
+        }
+
+        private List<HotMessageItem> CreateItems(long chatId, Messages messages, long cutoff)
+        {
+            var items = new List<HotMessageItem>(messages.MessagesValue.Count);
+            foreach (var message in messages.MessagesValue)
+            {
+                var (count, emoji, json) = ExtractReactions(message.InteractionInfo);
+                var (snippet, media) = ExtractSnippet(message.Content);
+                items.Add(new HotMessageItem
+                {
+                    ChatId = chatId, MessageId = message.Id, Date = message.Date,
+                    MaxReactionCount = count, TopEmoji = emoji, ReactionsJson = json,
+                    Snippet = snippet, HasMedia = media, IsCold = message.Date < cutoff,
+                    SenderName = GetSenderDisplayName(_clientService, message.SenderId)
+                });
+            }
+            return items;
         }
 
         private static (string Snippet, bool HasMedia) ExtractSnippet(MessageContent content)
         {
-            if (content is MessageText text)
-            {
-                return (Truncate(text.Text?.Text), false);
-            }
-            else if (content is MessagePhoto photo)
-            {
-                var caption = !string.IsNullOrEmpty(photo.Caption?.Text) ? photo.Caption.Text : "[图片]";
-                return (Truncate(caption), true);
-            }
-            else if (content is MessageVideo video)
-            {
-                var caption = !string.IsNullOrEmpty(video.Caption?.Text) ? video.Caption.Text : "[视频]";
-                return (Truncate(caption), true);
-            }
-            else if (content is MessageDocument doc)
-            {
-                var caption = !string.IsNullOrEmpty(doc.Caption?.Text) ? doc.Caption.Text : (doc.Document?.FileName ?? "[文件]");
-                return (Truncate(caption), true);
-            }
-            else if (content is MessageAnimation anim)
-            {
-                var caption = !string.IsNullOrEmpty(anim.Caption?.Text) ? anim.Caption.Text : "[GIF动图]";
-                return (Truncate(caption), true);
-            }
-            else if (content is MessagePoll poll)
-            {
-                return ($"[投票] {poll.Poll?.Question}", false);
-            }
+            if (content is MessageText text) return (Truncate(text.Text?.Text), false);
+            if (content is MessagePhoto photo) return (Truncate(string.IsNullOrEmpty(photo.Caption?.Text) ? "[图片]" : photo.Caption.Text), true);
+            if (content is MessageVideo video) return (Truncate(string.IsNullOrEmpty(video.Caption?.Text) ? "[视频]" : video.Caption.Text), true);
+            if (content is MessageDocument document) return (Truncate(string.IsNullOrEmpty(document.Caption?.Text) ? document.Document?.FileName ?? "[文件]" : document.Caption.Text), true);
+            if (content is MessageAnimation animation) return (Truncate(string.IsNullOrEmpty(animation.Caption?.Text) ? "[GIF动图]" : animation.Caption.Text), true);
+            if (content is MessagePoll poll) return (Truncate($"[投票] {poll.Poll?.Question}"), false);
             return ("[消息]", false);
         }
 
-        private static string Truncate(string str, int maxLen = 100)
+        private static string Truncate(string text)
         {
-            if (string.IsNullOrEmpty(str)) return string.Empty;
-            var clean = str.Replace("\r\n", " ").Replace("\n", " ").Trim();
-            return clean.Length <= maxLen ? clean : clean.Substring(0, maxLen) + "...";
+            if (string.IsNullOrEmpty(text)) return string.Empty;
+            var clean = text.Replace("\r\n", " ").Replace("\n", " ").Trim();
+            return clean.Length <= 100 ? clean : clean.Substring(0, 100) + "...";
         }
 
         private static string GetSenderDisplayName(IClientService clientService, MessageSender sender)
         {
-            if (sender is MessageSenderUser user)
-            {
-                if (clientService.TryGetUser(user.UserId, out var u))
-                {
-                    return $"{u.FirstName} {u.LastName}".Trim();
-                }
-            }
-            else if (sender is MessageSenderChat chatSender)
-            {
-                if (clientService.TryGetChat(chatSender.ChatId, out var c))
-                {
-                    return c.Title ?? string.Empty;
-                }
-            }
+            if (sender is MessageSenderUser user && clientService.TryGetUser(user.UserId, out var value)) return $"{value.FirstName} {value.LastName}".Trim();
+            if (sender is MessageSenderChat chat && clientService.TryGetChat(chat.ChatId, out var channel)) return channel.Title ?? string.Empty;
             return string.Empty;
+        }
+
+        public Task ShutdownAsync()
+        {
+            Dispose();
+            return _shutdown;
         }
 
         public void Dispose()
         {
-            foreach (var kv in _crawlers)
+            lock (_lifecycleLock)
             {
-                try { kv.Value.Cts.Cancel(); kv.Value.Cts.Dispose(); } catch { }
+                if (_disposed) return;
+                _disposed = true;
+                _lifetime.Cancel();
+                _updateSignal.Writer.TryComplete();
+                _pendingUpdates.Clear();
+                CrawlerProgress = null;
+                MessagesChanged = null;
+                var workers = _workers.Concat(new[] { _initialization, _updateWorker }).ToArray();
+                _shutdown = Task.WhenAll(workers).ContinueWith(task =>
+                {
+                    if (task.IsFaulted) Logger.Exception(task.Exception);
+                    _pendingUpdates.Clear();
+                    _database.Dispose();
+                    _lifetime.Dispose();
+                });
             }
-            _crawlers.Clear();
-            _database?.Dispose();
         }
     }
 }

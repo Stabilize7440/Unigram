@@ -37,18 +37,22 @@ namespace Telegram.Views
         private List<HotMessageItem> _allCurrentItems = new List<HotMessageItem>();
         private System.Threading.CancellationTokenSource _panelCts;
         private int _loadVersion = 0;
+        private HotReactionsService _service;
+        private Action<long, string, bool> _progressHandler;
+        private Action<long> _messagesHandler;
+        private Task _reloadTask;
+        private Task _refreshTask;
+        private bool _reloadQueued;
+        private bool _resetPageQueued;
+        private long _renderedRevision = -1;
 
         private static void HotLog(string msg)
         {
-            try
-            {
-                var dir = Windows.Storage.ApplicationData.Current.LocalFolder.Path;
-                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "hot_debug.log"), $"[{DateTime.Now:HH:mm:ss.fff}] [Panel] {msg}\r\n");
-            }
-            catch { }
+            System.Diagnostics.Debug.WriteLine($"[HotReactions] {msg}");
         }
 
         public event EventHandler CloseRequested;
+        public event EventHandler MessageSelected;
 
         public HotReactionsPanel()
         {
@@ -68,99 +72,60 @@ namespace Telegram.Views
 
         public void Initialize(IClientService clientService, INavigationService navigationService, DialogViewModel dialogViewModel)
         {
+            var service = clientService.HotReactions;
+            if (_clientService != clientService || _service != service) Close();
             _clientService = clientService;
+            _service = service;
             _navigationService = navigationService;
             _dialogViewModel = dialogViewModel;
         }
 
         public async Task OpenAsync(long chatId)
         {
-            HotLog($"OpenAsync called: chatId={chatId}, currentChatId={_chatId}, Visibility={Visibility}");
-            if (_chatId == chatId && Visibility == Visibility.Visible && _panelCts != null && !_panelCts.IsCancellationRequested)
-            {
-                HotLog("OpenAsync: already open for same chat, returning.");
-                return;
-            }
-
-            // 先清理之前的任务与回调
-            try
-            {
-                _panelCts?.Cancel();
-                _panelCts?.Dispose();
-            }
-            catch { }
-            _panelCts = null;
-
-            if (_chatId != 0 && _chatId != chatId)
-            {
-                HotReactionsService.Current.SetCrawlerProgressCallback(_chatId, null);
-            }
-
-            if (_chatId != chatId)
-            {
-                _userPausedCrawler = false;
-                CrawlerToggleBtn.Content = "暂停慢爬";
-                CrawlerStatusText.Text = "冷区同步准备中...";
-            }
-
+            if (_chatId == chatId && Visibility == Visibility.Visible && _panelCts?.IsCancellationRequested == false) return;
+            Close();
             _chatId = chatId;
             Visibility = Visibility.Visible;
-
-            _allCurrentItems.Clear();
-            MessagesList.ItemsSource = null;
+            _userPausedCrawler = _service.IsCrawlerPaused(chatId);
+            CrawlerToggleBtn.Content = _userPausedCrawler ? "继续慢爬" : "暂停慢爬";
+            CrawlerStatusText.Text = _userPausedCrawler ? "慢爬已暂停" : "冷区同步准备中...";
             PaginationSummaryText.Text = "加载中...";
             EmptyNotice.Visibility = Visibility.Collapsed;
             LoadingRing.IsActive = true;
             LoadingRing.Visibility = Visibility.Visible;
-
             UpdateFilterButtons();
             UpdateRankModeButtons();
 
-            _panelCts = new System.Threading.CancellationTokenSource();
-            var boundCts = _panelCts;
+            var boundCts = _panelCts = new System.Threading.CancellationTokenSource();
             var token = boundCts.Token;
-            var targetChatId = chatId;
-
+            _progressHandler = (id, status, running) =>
+            {
+                if (id == chatId) OnCrawlerProgress(status, running, boundCts, chatId);
+            };
+            _messagesHandler = id =>
+            {
+                if (id != chatId || token.IsCancellationRequested) return;
+                _ = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                {
+                    if (boundCts != _panelCts || token.IsCancellationRequested) return;
+                    if (_renderedRevision != _service.Database.GetRevision(id)) _ = ReloadListAsync(token: token);
+                });
+            };
+            _service.CrawlerProgress += _progressHandler;
+            _service.MessagesChanged += _messagesHandler;
             try
             {
-                // 1. 注册慢爬进度监听（若后台慢爬正在运行，立刻无缝接管）
-                HotReactionsService.Current.SetCrawlerProgressCallback(targetChatId, (status, isRunning) =>
-                {
-                    OnCrawlerProgress(status, isRunning, boundCts, targetChatId);
-                });
-
-                // 2. 秒开：优先呈现本地已有索引，杜绝空白等待
-                HotLog("OpenAsync: calling ReloadListAsync");
+                await _service.InitializeAsync();
+                if (token.IsCancellationRequested) return;
                 await ReloadListAsync(resetPage: true, token: token);
                 if (token.IsCancellationRequested) return;
-
-                // 3. 静默增量同步近7天热区消息
-                HotLog("OpenAsync: calling RefreshDataAsync");
                 await RefreshDataAsync(token);
-                if (token.IsCancellationRequested) return;
-
-                // 4. 仅在用户未主动暂停且当前没有爬虫在跑时，才启动冷区后台慢爬
-                if (!_userPausedCrawler && !token.IsCancellationRequested && !HotReactionsService.Current.IsCrawlerRunning(targetChatId))
-                {
-                    HotLog("OpenAsync: starting cold crawler");
-                    HotReactionsService.Current.StartColdCrawler(_clientService, targetChatId, (status, isRunning) =>
-                    {
-                        OnCrawlerProgress(status, isRunning, boundCts, targetChatId);
-                    });
-                }
             }
-            catch (OperationCanceledException)
-            {
-                // 正常取消
-            }
+            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                HotLog($"OpenAsync EXCEPTION: {ex}");
                 Telegram.Logger.Exception(ex);
-                if (boundCts == _panelCts && !token.IsCancellationRequested)
-                {
-                    PaginationSummaryText.Text = "加载失败，请重试";
-                }
+                if (boundCts == _panelCts) PaginationSummaryText.Text = "加载失败，请重试";
             }
             finally
             {
@@ -174,19 +139,24 @@ namespace Telegram.Views
 
         public void Close()
         {
-            try
+            if (_service != null)
             {
-                _panelCts?.Cancel();
-                _panelCts?.Dispose();
+                _service.CrawlerProgress -= _progressHandler;
+                _service.MessagesChanged -= _messagesHandler;
             }
-            catch { }
+            _progressHandler = null;
+            _messagesHandler = null;
+            _panelCts?.Cancel();
+            _panelCts?.Dispose();
             _panelCts = null;
-
-            if (_chatId != 0)
-            {
-                HotReactionsService.Current.SetCrawlerProgressCallback(_chatId, null);
-            }
-
+            _loadVersion++;
+            _reloadTask = null;
+            _refreshTask = null;
+            _reloadQueued = false;
+            _resetPageQueued = false;
+            _renderedRevision = -1;
+            _allCurrentItems.Clear();
+            MessagesList.ItemsSource = null;
             Visibility = Visibility.Collapsed;
         }
 
@@ -196,39 +166,44 @@ namespace Telegram.Views
             CloseRequested?.Invoke(this, EventArgs.Empty);
         }
 
-        private async Task RefreshDataAsync(System.Threading.CancellationToken token = default)
+        private Task RefreshDataAsync(System.Threading.CancellationToken token = default)
         {
-            if (token.IsCancellationRequested) return;
+            if (token.IsCancellationRequested || _panelCts == null) return Task.CompletedTask;
+            if (_refreshTask?.IsCompleted == false) return _refreshTask;
+            return _refreshTask = RefreshCoreAsync(token);
+        }
 
+        private async Task RefreshCoreAsync(System.Threading.CancellationToken token)
+        {
+            var service = _service;
+            var client = _clientService;
+            var chatId = _chatId;
             if (_allCurrentItems.Count == 0)
             {
                 LoadingRing.IsActive = true;
                 LoadingRing.Visibility = Visibility.Visible;
-                EmptyNotice.Visibility = Visibility.Collapsed;
             }
-
             try
             {
-                await HotReactionsService.Current.SyncHotWindowAsync(_clientService, _chatId, status =>
+                await service.SyncHotWindowAsync(client, chatId, status =>
                 {
                     if (token.IsCancellationRequested) return;
-                    var ignored = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
+                    _ = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
                     {
-                        if (token.IsCancellationRequested) return;
-                        CrawlerStatusText.Text = status;
+                        if (!token.IsCancellationRequested) CrawlerStatusText.Text = status;
                     });
-                });
-
-                if (token.IsCancellationRequested) return;
-                await ReloadListAsync(resetPage: true, token: token);
+                }, token);
+                if (!token.IsCancellationRequested) await ReloadListAsync(resetPage: true, token: token);
             }
+            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
                 Telegram.Logger.Exception(ex);
+                if (!token.IsCancellationRequested) CrawlerStatusText.Text = "同步失败，未跳过失败批次，请重试";
             }
             finally
             {
-                if (!token.IsCancellationRequested && _panelCts != null && !_panelCts.IsCancellationRequested)
+                if (!token.IsCancellationRequested)
                 {
                     LoadingRing.IsActive = false;
                     LoadingRing.Visibility = Visibility.Collapsed;
@@ -238,7 +213,7 @@ namespace Telegram.Views
 
         private void UpdateThresholdUI(ChannelSyncState state = null)
         {
-            state ??= HotReactionsService.Current.Database.GetSyncState(_chatId);
+            state ??= _service.Database.GetSyncState(_chatId);
 
             if (state.CustomThreshold.HasValue)
             {
@@ -259,42 +234,53 @@ namespace Telegram.Views
             }
         }
 
-        private async Task ReloadListAsync(bool resetPage = false, System.Threading.CancellationToken token = default)
+        private Task ReloadListAsync(bool resetPage = false, System.Threading.CancellationToken token = default)
         {
-            int version = System.Threading.Interlocked.Increment(ref _loadVersion);
+            if (token.IsCancellationRequested || _panelCts == null) return Task.CompletedTask;
+            _loadVersion++;
+            _reloadQueued = true;
+            _resetPageQueued |= resetPage;
+            if (_reloadTask?.IsCompleted == false) return _reloadTask;
+            return _reloadTask = ReloadLoopAsync(_panelCts, _chatId, _service);
+        }
 
-            if (resetPage)
+        private async Task ReloadLoopAsync(System.Threading.CancellationTokenSource boundCts, long chatId, HotReactionsService service)
+        {
+            var token = boundCts.Token;
+            try
             {
-                _currentPage = 1;
+                while (_reloadQueued && boundCts == _panelCts && !token.IsCancellationRequested)
+                {
+                    _reloadQueued = false;
+                    if (_resetPageQueued) _currentPage = 1;
+                    _resetPageQueued = false;
+                    int version = _loadVersion;
+                    var weekOnly = _isWeekOnly;
+                    var mode = _rankMode;
+                    var (items, state, revision) = await Task.Run(() =>
+                    {
+                        var revision = service.Database.GetRevision(chatId);
+                        var state = service.Database.GetSyncState(chatId);
+                        long? minDate = weekOnly ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 7 * 86400 : null;
+                        var items = service.Database.GetTopMessages(chatId, 0, minDate, state.EffectiveThreshold, mode, token);
+                        return (items, state, revision);
+                    }, token);
+                    if (boundCts != _panelCts || token.IsCancellationRequested) return;
+                    if (version != _loadVersion) continue;
+                    _allCurrentItems = items;
+                    _renderedRevision = revision;
+                    UpdateThresholdUI(state);
+                    RenderCurrentPage();
+                    LoadingRing.IsActive = false;
+                    LoadingRing.Visibility = Visibility.Collapsed;
+                }
             }
-
-            var chatId = _chatId;
-            var isWeekOnly = _isWeekOnly;
-            var rankMode = _rankMode;
-
-            // 数据库读取、JSON解析与情绪重排全部移至后台线程
-            var (items, state) = await Task.Run(() =>
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
             {
-                var syncState = HotReactionsService.Current.Database.GetSyncState(chatId);
-                long? minDate = isWeekOnly ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (7 * 86400) : null;
-                var topItems = HotReactionsService.Current.Database.GetTopMessages(chatId, 0, minDate, syncState.EffectiveThreshold, rankMode);
-                return (topItems, syncState);
-            });
-
-            if (version != _loadVersion || token.IsCancellationRequested || _panelCts == null || _panelCts.IsCancellationRequested)
-            {
-                return;
+                Telegram.Logger.Exception(ex);
+                if (boundCts == _panelCts) PaginationSummaryText.Text = "加载失败，请重试";
             }
-
-            _allCurrentItems = items;
-            UpdateThresholdUI(state);
-            RenderCurrentPage();
-            if (items.Count > 0)
-            {
-                LoadingRing.IsActive = false;
-                LoadingRing.Visibility = Visibility.Collapsed;
-            }
-            HotLog($"ReloadListAsync finished: count={items.Count}, effectiveThreshold={state?.EffectiveThreshold}");
         }
 
         private void RenderCurrentPage()
@@ -418,31 +404,33 @@ namespace Telegram.Views
         private async void SaveConfigEmoji_Click(object sender, RoutedEventArgs e)
         {
             var emoji = ConfigEmojiInput.Text?.Trim();
-            if (string.IsNullOrEmpty(emoji)) return;
-
-            int catIndex = ConfigCategorySelect.SelectedIndex;
-            if (catIndex >= 0 && catIndex <= 2)
+            var index = ConfigCategorySelect.SelectedIndex;
+            if (string.IsNullOrEmpty(emoji) || emoji == ReactionSentimentService.PaidReactionKey || index < 0 || index > 2) return;
+            var boundCts = _panelCts;
+            if (boundCts == null) return;
+            var token = boundCts.Token;
+            var database = _service.Database;
+            ConfigEmojiInput.Text = string.Empty;
+            try
             {
-                var boundCts = _panelCts;
-                var token = boundCts?.Token ?? default;
-                var category = (SentimentCategory)catIndex;
-                ReactionSentimentService.Current.SetCustomCategory(emoji, category);
-                ConfigEmojiInput.Text = string.Empty;
-                await Task.Run(() => HotReactionsService.Current.Database.SaveSentimentConfig(emoji, category));
-                if (token.IsCancellationRequested || boundCts != _panelCts || _panelCts?.IsCancellationRequested == true) return;
-                await ReloadListAsync(resetPage: false, token: token);
+                await Task.Run(() => database.SaveSentimentConfig(emoji, (SentimentCategory)index));
+                if (boundCts == _panelCts && !token.IsCancellationRequested) await ReloadListAsync(token: token);
             }
+            catch (Exception ex) { Telegram.Logger.Exception(ex); }
         }
 
         private async void ResetConfigEmoji_Click(object sender, RoutedEventArgs e)
         {
             var boundCts = _panelCts;
-            var token = boundCts?.Token ?? default;
-            ReactionSentimentService.Current.ResetToDefaults();
-            ConfigEmojiInput.Text = string.Empty;
-            await Task.Run(() => HotReactionsService.Current.Database.ClearSentimentConfigs());
-            if (token.IsCancellationRequested || boundCts != _panelCts || _panelCts?.IsCancellationRequested == true) return;
-            await ReloadListAsync(resetPage: false, token: token);
+            if (boundCts == null) return;
+            var token = boundCts.Token;
+            var database = _service.Database;
+            try
+            {
+                await Task.Run(database.ClearSentimentConfigs);
+                if (boundCts == _panelCts && !token.IsCancellationRequested) await ReloadListAsync(token: token);
+            }
+            catch (Exception ex) { Telegram.Logger.Exception(ex); }
         }
 
         private void UpdateFilterButtons()
@@ -464,38 +452,90 @@ namespace Telegram.Views
 
         private void FilterAll_Click(object sender, RoutedEventArgs e)
         {
-            if (_isWeekOnly)
-            {
-                _isWeekOnly = false;
-                UpdateFilterButtons();
-                var boundCts = _panelCts;
-                _ = ReloadListAsync(resetPage: true, token: boundCts?.Token ?? default);
-                if (!_userPausedCrawler && !HotReactionsService.Current.IsCrawlerRunning(_chatId))
-                {
-                    var boundChatId = _chatId;
-                    HotReactionsService.Current.StartColdCrawler(_clientService, boundChatId, (status, isRunning) =>
-                    {
-                        OnCrawlerProgress(status, isRunning, boundCts, boundChatId);
-                    });
-                }
-            }
+            if (!_isWeekOnly) return;
+            _isWeekOnly = false;
+            UpdateFilterButtons();
+            _ = ReloadListAsync(resetPage: true, token: _panelCts?.Token ?? default);
+            if (!_userPausedCrawler) _service.StartColdCrawler(_clientService, _chatId);
         }
 
         private async void SetThreshold_Click(object sender, RoutedEventArgs e)
         {
-            var boundCts = _panelCts;
-            var token = boundCts?.Token ?? default;
             var input = ThresholdInput.Text?.Trim();
-            int? customVal = null;
-            if (!string.IsNullOrEmpty(input) && int.TryParse(input, out int parsed) && parsed >= 1)
+            int? value = null;
+            if (!string.IsNullOrEmpty(input))
             {
-                customVal = parsed;
+                if (!int.TryParse(input, out int parsed) || parsed < 1)
+                {
+                    ThresholdInfoText.Text = "请输入大于 0 的整数；留空恢复自适应门槛";
+                    return;
+                }
+                value = parsed;
             }
-
+            var boundCts = _panelCts;
+            if (boundCts == null) return;
+            var token = boundCts.Token;
+            var service = _service;
+            var client = _clientService;
             var chatId = _chatId;
-            await Task.Run(() => HotReactionsService.Current.SetUserCustomThreshold(chatId, customVal));
-            if (token.IsCancellationRequested || boundCts != _panelCts || _panelCts?.IsCancellationRequested == true) return;
-            await ReloadListAsync(resetPage: true, token: token);
+            try
+            {
+                bool rescan = await Task.Run(() => service.Database.RequiresRescan(chatId, value));
+                if (boundCts != _panelCts || token.IsCancellationRequested) return;
+                if (rescan)
+                {
+                    if (!await ConfirmRescanAsync(token)) return;
+                    if (boundCts != _panelCts || token.IsCancellationRequested) return;
+                }
+                bool applied = await Task.Run(() => service.SetUserCustomThreshold(chatId, value, rescan));
+                if (!applied)
+                {
+                    // A concurrent batch may have raised the pruning floor since the first check.
+                    if (!await ConfirmRescanAsync(token)) return;
+                    if (boundCts != _panelCts || token.IsCancellationRequested) return;
+                    rescan = true;
+                    await Task.Run(() => service.SetUserCustomThreshold(chatId, value, rescanConfirmed: true));
+                }
+                if (rescan)
+                {
+                    await service.ResetChannelSyncAsync(chatId);
+                    if (boundCts != _panelCts || token.IsCancellationRequested) return;
+                    _userPausedCrawler = false;
+                    await RefreshDataAsync(token);
+                    if (boundCts == _panelCts && !token.IsCancellationRequested) service.StartColdCrawler(client, chatId);
+                }
+                if (boundCts == _panelCts && !token.IsCancellationRequested) await ReloadListAsync(resetPage: true, token: token);
+            }
+            catch (Exception ex) { Telegram.Logger.Exception(ex); }
+        }
+
+        private async Task<bool> ConfirmRescanAsync(System.Threading.CancellationToken token)
+        {
+            // A Flyout also works inside the legacy modal host; queuing another dialog would deadlock it.
+            var result = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var content = new StackPanel { Width = 280, Spacing = 8 };
+            content.Children.Add(new TextBlock
+            {
+                Text = "较低反应数的历史消息已被剪枝。确认后会保留新门槛并从头重扫，后台请求受账号级限速控制。",
+                TextWrapping = TextWrapping.Wrap
+            });
+            var confirm = new Button { Content = "重扫并应用", HorizontalAlignment = HorizontalAlignment.Stretch };
+            var cancel = new Button { Content = "取消", HorizontalAlignment = HorizontalAlignment.Stretch };
+            content.Children.Add(confirm);
+            content.Children.Add(cancel);
+            var flyout = new Flyout { Content = content };
+            confirm.Click += (sender, args) => { result.TrySetResult(true); flyout.Hide(); };
+            cancel.Click += (sender, args) => flyout.Hide();
+            flyout.Closed += (sender, args) => result.TrySetResult(false);
+            using var registration = token.Register(() =>
+            {
+                result.TrySetResult(false);
+                try { _ = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, flyout.Hide); }
+                catch (Exception ex) { Telegram.Logger.Exception(ex); }
+            });
+            if (token.IsCancellationRequested) return false;
+            flyout.ShowAt(SetThresholdBtn);
+            return await result.Task;
         }
 
         private async void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -505,73 +545,59 @@ namespace Telegram.Views
 
         private async void ResetAndRescan_Click(object sender, RoutedEventArgs e)
         {
-            _userPausedCrawler = false;
             var boundCts = _panelCts;
-            var token = boundCts?.Token ?? default;
+            if (boundCts == null) return;
+            var token = boundCts.Token;
+            var service = _service;
+            var client = _clientService;
             var chatId = _chatId;
-            CrawlerStatusText.Text = "已重置频道历史索引，重新全量扫描...";
-            await HotReactionsService.Current.ResetChannelSyncAsync(chatId);
-            if (token.IsCancellationRequested || boundCts != _panelCts || _panelCts?.IsCancellationRequested == true) return;
-            await ReloadListAsync(resetPage: true, token: token);
-            if (token.IsCancellationRequested || boundCts != _panelCts || _panelCts?.IsCancellationRequested == true) return;
-            await RefreshDataAsync(token);
-            if (!_userPausedCrawler && token.IsCancellationRequested == false && boundCts == _panelCts && _panelCts?.IsCancellationRequested == false)
+            try
             {
-                var boundChatId = _chatId;
-                HotReactionsService.Current.StartColdCrawler(_clientService, boundChatId, (status, isRunning) =>
-                {
-                    OnCrawlerProgress(status, isRunning, boundCts, boundChatId);
-                }, forceResume: true);
+                await service.ResetChannelSyncAsync(chatId);
+                if (boundCts != _panelCts || token.IsCancellationRequested) return;
+                _userPausedCrawler = false;
+                await ReloadListAsync(resetPage: true, token: token);
+                await RefreshDataAsync(token);
+                if (boundCts == _panelCts && !token.IsCancellationRequested) service.StartColdCrawler(client, chatId);
             }
+            catch (Exception ex) { Telegram.Logger.Exception(ex); }
         }
 
         private void CrawlerToggle_Click(object sender, RoutedEventArgs e)
         {
-            var boundCts = _panelCts;
-            var boundChatId = _chatId;
-            bool isRunning = HotReactionsService.Current.IsCrawlerRunning(boundChatId);
-            if (isRunning)
+            if (_service.IsCrawlerRunning(_chatId))
             {
                 _userPausedCrawler = true;
-                HotReactionsService.Current.StopColdCrawler(boundChatId);
+                _ = _service.StopColdCrawler(_chatId);
                 CrawlerToggleBtn.Content = "继续慢爬";
                 CrawlerStatusText.Text = "慢爬已暂停";
             }
             else
             {
                 _userPausedCrawler = false;
-                HotReactionsService.Current.StartColdCrawler(_clientService, boundChatId, (status, isRunning) =>
-                {
-                    OnCrawlerProgress(status, isRunning, boundCts, boundChatId);
-                }, forceResume: true);
+                _service.StartColdCrawler(_clientService, _chatId);
                 CrawlerToggleBtn.Content = "暂停慢爬";
-                CrawlerStatusText.Text = "慢爬已启动...";
             }
         }
 
         private void OnCrawlerProgress(string status, bool isRunning, System.Threading.CancellationTokenSource boundCts, long boundChatId)
         {
-            if (boundCts == null || boundCts.IsCancellationRequested)
+            if (boundCts == null || boundCts.IsCancellationRequested) return;
+            _ = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, async () =>
             {
-                return;
-            }
-
-            var ignored = Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, async () =>
-            {
-                if (boundCts != _panelCts || boundCts.IsCancellationRequested || _chatId != boundChatId)
-                {
-                    return;
-                }
-
-                if (_userPausedCrawler && isRunning)
-                {
-                    return;
-                }
-
+                if (boundCts != _panelCts || boundCts.IsCancellationRequested || _chatId != boundChatId) return;
+                if (_userPausedCrawler && isRunning) return;
                 CrawlerStatusText.Text = status;
                 CrawlerToggleBtn.Content = isRunning ? "暂停慢爬" : "继续慢爬";
-
-                await ReloadListAsync(resetPage: false, token: boundCts.Token);
+                var service = _service;
+                try
+                {
+                    var state = await Task.Run(() => service.Database.GetSyncState(boundChatId));
+                    if (boundCts != _panelCts || boundCts.IsCancellationRequested) return;
+                    UpdateThresholdUI(state);
+                    if (_renderedRevision != service.Database.GetRevision(boundChatId)) await ReloadListAsync(token: boundCts.Token);
+                }
+                catch (Exception ex) { Telegram.Logger.Exception(ex); }
             });
         }
 
@@ -589,6 +615,7 @@ namespace Telegram.Views
                 }
                 _lastClickedMsgId = item.MessageId;
                 _lastClickTime = now;
+                MessageSelected?.Invoke(this, EventArgs.Empty);
 
                 // 同屏平滑定位：在常规历史流下直接滚动高亮；在论坛话题/线程模式下通过导航服务精确切换
                 if (_dialogViewModel != null && _dialogViewModel.ChatId == _chatId && _dialogViewModel.Type == DialogType.History)

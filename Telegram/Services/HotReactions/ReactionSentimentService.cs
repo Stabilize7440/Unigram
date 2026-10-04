@@ -31,8 +31,17 @@ namespace Telegram.Services.HotReactions
 
     public class ReactionSentimentService
     {
-        private static readonly Lazy<ReactionSentimentService> _current = new(() => new ReactionSentimentService(), System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
-        public static ReactionSentimentService Current => _current.Value;
+        public const string PaidReactionKey = "paid";
+        public const string CustomReactionPrefix = "custom:";
+        private int _version;
+        public int Version => System.Threading.Volatile.Read(ref _version);
+
+        public static string DisplayEmoji(string key)
+        {
+            if (key == PaidReactionKey) return "🌟";
+            if (key?.StartsWith(CustomReactionPrefix, StringComparison.Ordinal) == true) return "⭐";
+            return key ?? "👍";
+        }
 
         private static readonly HashSet<string> DefaultPositive = new(StringComparer.Ordinal)
         {
@@ -68,12 +77,13 @@ namespace Telegram.Services.HotReactions
                         _customCategories[kvp.Key] = kvp.Value;
                     }
                 }
+                System.Threading.Interlocked.Increment(ref _version);
             }
         }
 
         public SentimentCategory? GetCategory(string emoji)
         {
-            if (string.IsNullOrEmpty(emoji)) return null;
+            if (string.IsNullOrEmpty(emoji) || emoji == PaidReactionKey) return null;
 
             if (_customCategories.TryGetValue(emoji, out var cat))
             {
@@ -99,6 +109,7 @@ namespace Telegram.Services.HotReactions
             {
                 _customCategories.TryRemove(emoji, out _);
             }
+            System.Threading.Interlocked.Increment(ref _version);
         }
 
         public void ResetToDefaults()
@@ -106,6 +117,7 @@ namespace Telegram.Services.HotReactions
             lock (_lock)
             {
                 _customCategories.Clear();
+                System.Threading.Interlocked.Increment(ref _version);
             }
         }
 
@@ -181,42 +193,38 @@ namespace Telegram.Services.HotReactions
             HotMessageItem item,
             HotRankMode mode)
         {
-            var dict = ParseReactionsJson(item.ReactionsJson);
+            if (mode == HotRankMode.All)
+            {
+                return (item.MaxReactionCount, $"{DisplayEmoji(item.TopEmoji)} {FormatCount(item.MaxReactionCount)}", null);
+            }
 
-            // 历史老数据兜底：若 reactions_json 为空，使用 TopEmoji 与 MaxReactionCount 填充
+            var dict = item.Reactions;
             if (dict.Count == 0 && !string.IsNullOrEmpty(item.TopEmoji) && item.MaxReactionCount > 0)
             {
-                dict[item.TopEmoji] = item.MaxReactionCount;
+                dict = new Dictionary<string, int> { [item.TopEmoji] = item.MaxReactionCount };
             }
 
             switch (mode)
             {
-                case HotRankMode.All:
-                {
-                    int score = item.MaxReactionCount;
-                    string emoji = item.TopEmoji ?? "👍";
-                    return (score, $"{emoji} {FormatCount(score)}", null);
-                }
-
                 case HotRankMode.Positive:
                 {
                     var (maxCount, bestEmoji) = GetCategoryTop(dict, SentimentCategory.Positive);
                     if (maxCount <= 0) return (0, null, null);
-                    return (maxCount, $"{bestEmoji} {FormatCount(maxCount)}", null);
+                    return (maxCount, $"{DisplayEmoji(bestEmoji)} {FormatCount(maxCount)}", null);
                 }
 
                 case HotRankMode.Negative:
                 {
                     var (maxCount, bestEmoji) = GetCategoryTop(dict, SentimentCategory.Negative);
                     if (maxCount <= 0) return (0, null, null);
-                    return (maxCount, $"{bestEmoji} {FormatCount(maxCount)}", null);
+                    return (maxCount, $"{DisplayEmoji(bestEmoji)} {FormatCount(maxCount)}", null);
                 }
 
                 case HotRankMode.Shock:
                 {
                     var (maxCount, bestEmoji) = GetCategoryTop(dict, SentimentCategory.Shock);
                     if (maxCount <= 0) return (0, null, null);
-                    return (maxCount, $"{bestEmoji} {FormatCount(maxCount)}", null);
+                    return (maxCount, $"{DisplayEmoji(bestEmoji)} {FormatCount(maxCount)}", null);
                 }
 
                 case HotRankMode.NetPositive:
@@ -233,7 +241,7 @@ namespace Telegram.Services.HotReactions
                     }
 
                     string badge = $"✨ +{FormatCount(netScore)}";
-                    string sub = $"{posEmoji ?? "👍"} {FormatCount(maxPos)} · {negEmoji ?? "👎"} {FormatCount(maxNeg)}";
+                    string sub = $"{DisplayEmoji(posEmoji)} {FormatCount(maxPos)} · {DisplayEmoji(negEmoji ?? "👎")} {FormatCount(maxNeg)}";
                     return (netScore, badge, sub);
                 }
 
@@ -242,7 +250,7 @@ namespace Telegram.Services.HotReactions
             }
         }
 
-        private (int MaxCount, string BestEmoji) GetCategoryTop(Dictionary<string, int> reactions, SentimentCategory targetCategory)
+        private (int MaxCount, string BestEmoji) GetCategoryTop(IReadOnlyDictionary<string, int> reactions, SentimentCategory targetCategory)
         {
             int max = 0;
             string bestEmoji = null;

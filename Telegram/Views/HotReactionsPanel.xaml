@@ -95,13 +95,13 @@
                     <Flyout>
                         <StackPanel Width="260" Spacing="8">
                             <TextBlock Text="自定义表情倾向分类" FontWeight="SemiBold" FontSize="14" />
-                            <TextBlock Text="为自定义或未收录的 Emoji 指定情绪倾向" FontSize="11" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" TextWrapping="Wrap" />
+                            <TextBlock Text="普通表情如 👍；专属表情填写 custom:ID（悬停榜单徽章可查看）。付费反应只参与全部榜。" FontSize="11" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" TextWrapping="Wrap" />
                             <Grid Margin="0,4,0,0">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
-                                <TextBox x:Name="ConfigEmojiInput" PlaceholderText="表情如 🎉" Margin="0,0,6,0" MaxLength="10" />
+                                <TextBox x:Name="ConfigEmojiInput" PlaceholderText="表情或 custom:ID" Margin="0,0,6,0" MaxLength="32" />
                                 <ComboBox x:Name="ConfigCategorySelect" SelectedIndex="0" Grid.Column="1">
                                     <ComboBoxItem Content="正面/赞赏" />
                                     <ComboBoxItem Content="负面/翻车" />
@@ -157,7 +157,8 @@
                                     CornerRadius="14"
                                     Padding="8,3"
                                     VerticalAlignment="Center"
-                                    Margin="0,0,8,0">
+                                    Margin="0,0,8,0"
+                                    ToolTipService.ToolTip="{x:Bind ReactionKey}">
                                 <TextBlock Text="{x:Bind BadgeText}" FontWeight="Bold" FontSize="13" VerticalAlignment="Center" />
                             </Border>
 

@@ -7,664 +7,550 @@
 
 using SQLitePCL;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using Telegram.Common;
+using System.Threading;
 using Windows.Storage;
 
 namespace Telegram.Services.HotReactions
 {
     public class HotReactionsDatabase : IDisposable
     {
-        private static readonly object _lock = new();
+        private readonly object _lock = new();
+        private readonly string _path;
+        private readonly ConcurrentDictionary<long, long> _revisions = new();
         private sqlite3 _db;
-        private volatile bool _isInitialized;
+        private bool _initialized;
+        private bool _disposed;
+        private long _cachedChatId;
+        private Dictionary<long, HotMessageItem> _cachedMessages;
+        private List<HotMessageItem> _cachedRanking;
+        private HotRankMode _cachedMode;
+        private int _cachedThreshold;
+        private long? _cachedMinDate;
+        private int _cachedSentimentVersion;
+
+        public ReactionSentimentService Sentiments { get; } = new();
 
         static HotReactionsDatabase()
         {
-            try
+            Batteries_V2.Init();
+        }
+
+        public HotReactionsDatabase(int sessionId, long userId)
+            : this(Path.Combine(ApplicationData.Current.LocalFolder.Path, sessionId.ToString(), $"hot_reactions_{userId}.db"))
+        {
+            if (userId <= 0)
             {
-                Batteries_V2.Init();
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"Failed to initialize sqlite3 provider: {ex}");
+                throw new ArgumentOutOfRangeException(nameof(userId));
             }
         }
 
-        public void EnsureInitialized()
+        internal HotReactionsDatabase(string path)
         {
-            if (_isInitialized)
-            {
-                return;
-            }
-            Initialize();
+            _path = path;
         }
 
         public void Initialize()
         {
             lock (_lock)
             {
-                if (_isInitialized)
+                ThrowIfDisposed();
+                if (_initialized) return;
+
+                Directory.CreateDirectory(Path.GetDirectoryName(_path));
+                var result = raw.sqlite3_open(_path, out _db);
+                if (result != raw.SQLITE_OK)
                 {
-                    return;
+                    var error = raw.sqlite3_errmsg(_db).utf8_to_string();
+                    raw.sqlite3_close(_db);
+                    _db = null;
+                    throw new InvalidOperationException($"Cannot open hot reactions database ({result}): {error}");
                 }
 
                 try
                 {
-                    if (_db == null)
+                    ExecuteNonQuery("PRAGMA busy_timeout = 3000;");
+                    ExecuteNonQuery("PRAGMA journal_mode = WAL;");
+                    ExecuteNonQuery(@"CREATE TABLE IF NOT EXISTS channel_sync_state (
+                        chat_id INTEGER PRIMARY KEY,
+                        newest_synced_msg_id INTEGER DEFAULT 0,
+                        oldest_synced_msg_id INTEGER DEFAULT 0,
+                        cold_sync_completed INTEGER DEFAULT 0,
+                        sample_count INTEGER DEFAULT 0,
+                        sample_sum INTEGER DEFAULT 0,
+                        computed_threshold INTEGER DEFAULT 1,
+                        custom_threshold INTEGER,
+                        last_hot_sync INTEGER DEFAULT 0,
+                        earliest_msg_id INTEGER DEFAULT 0,
+                        earliest_msg_date INTEGER DEFAULT 0,
+                        pending_sync_from_id INTEGER DEFAULT 0,
+                        pending_sync_newest_id INTEGER DEFAULT 0,
+                        pending_sync_stop_id INTEGER DEFAULT 0,
+                        indexed_threshold INTEGER DEFAULT 1
+                    );");
+                    ExecuteNonQuery(@"CREATE TABLE IF NOT EXISTS channel_hot_messages (
+                        chat_id INTEGER,
+                        message_id INTEGER,
+                        date INTEGER DEFAULT 0,
+                        max_reaction_count INTEGER DEFAULT 0,
+                        top_emoji TEXT,
+                        snippet TEXT,
+                        sender_name TEXT,
+                        has_media INTEGER DEFAULT 0,
+                        is_cold INTEGER DEFAULT 0,
+                        is_deleted INTEGER DEFAULT 0,
+                        reactions_json TEXT,
+                        PRIMARY KEY (chat_id, message_id)
+                    );");
+                    ExecuteNonQuery(@"CREATE TABLE IF NOT EXISTS channel_reaction_samples (
+                        chat_id INTEGER, message_id INTEGER, reaction_count INTEGER,
+                        PRIMARY KEY (chat_id, message_id)
+                    );");
+                    ExecuteNonQuery("CREATE TABLE IF NOT EXISTS reaction_sentiment_config (emoji TEXT PRIMARY KEY, category INTEGER);");
+                    EnsureColumn("channel_hot_messages", "reactions_json", "TEXT");
+                    EnsureColumn("channel_sync_state", "earliest_msg_id", "INTEGER DEFAULT 0");
+                    EnsureColumn("channel_sync_state", "earliest_msg_date", "INTEGER DEFAULT 0");
+                    EnsureColumn("channel_sync_state", "pending_sync_from_id", "INTEGER DEFAULT 0");
+                    EnsureColumn("channel_sync_state", "pending_sync_newest_id", "INTEGER DEFAULT 0");
+                    EnsureColumn("channel_sync_state", "pending_sync_stop_id", "INTEGER DEFAULT 0");
+                    EnsureColumn("channel_sync_state", "indexed_threshold", "INTEGER DEFAULT 1");
+                    ExecuteNonQuery(@"CREATE INDEX IF NOT EXISTS idx_hot_rank
+                        ON channel_hot_messages(chat_id, is_deleted, max_reaction_count DESC, date DESC);");
+                    ExecuteNonQuery(@"CREATE INDEX IF NOT EXISTS idx_hot_date
+                        ON channel_hot_messages(chat_id, is_deleted, date DESC);");
+                    ExecuteNonQuery("PRAGMA user_version = 1;");
+
+                    using (var stmt = Prepare("SELECT chat_id FROM channel_sync_state;"))
                     {
-                        var dbPath = Path.Combine(ApplicationData.Current.LocalFolder.Path, "hot_reactions.db");
-                        var result = raw.sqlite3_open(dbPath, out _db);
-                        if (result != raw.SQLITE_OK)
+                        while (Step(stmt) == raw.SQLITE_ROW)
                         {
-                            Logger.Error($"Failed to open hot_reactions.db, code: {result}");
-                            return;
+                            _revisions.TryAdd(raw.sqlite3_column_int64(stmt, 0), 0);
                         }
                     }
-
-                    CreateTables();
-
-                    try
-                    {
-                        ExecuteNonQuery("ALTER TABLE channel_hot_messages ADD COLUMN reactions_json TEXT;");
-                    }
-                    catch { }
-
-                    try
-                    {
-                        ExecuteNonQuery("ALTER TABLE channel_sync_state ADD COLUMN earliest_msg_id INTEGER DEFAULT 0;");
-                    }
-                    catch { }
-
-                    try
-                    {
-                        ExecuteNonQuery("ALTER TABLE channel_sync_state ADD COLUMN earliest_msg_date INTEGER DEFAULT 0;");
-                    }
-                    catch { }
-
-                    var configs = InternalGetSentimentConfigs();
-                    ReactionSentimentService.Current.LoadCustomConfig(configs);
-
-                    ExecuteNonQuery("PRAGMA journal_mode = WAL;");
-                    ExecuteNonQuery("PRAGMA busy_timeout = 3000;");
-
-                    // 一次性修复：解除此前版本因单批消息数 < 100 误判造成的 cold_sync_completed = 1 封锁
-                    ExecuteNonQuery("UPDATE channel_sync_state SET cold_sync_completed = 0 WHERE cold_sync_completed = 1;");
-
-                    _isInitialized = true;
+                    Sentiments.LoadCustomConfig(ReadSentimentConfigs());
+                    _initialized = true;
                 }
-                catch (Exception ex)
+                catch
                 {
-                    Logger.Exception(ex);
+                    raw.sqlite3_close(_db);
+                    _db = null;
+                    throw;
                 }
             }
         }
 
-        private void CreateTables()
+        public void EnsureInitialized()
         {
-            ExecuteNonQuery(@"
-                CREATE TABLE IF NOT EXISTS channel_sync_state (
-                    chat_id INTEGER PRIMARY KEY,
-                    newest_synced_msg_id INTEGER,
-                    oldest_synced_msg_id INTEGER,
-                    cold_sync_completed INTEGER DEFAULT 0,
-                    sample_count INTEGER DEFAULT 0,
-                    sample_sum INTEGER DEFAULT 0,
-                    computed_threshold INTEGER DEFAULT 1,
-                    custom_threshold INTEGER DEFAULT NULL,
-                    last_hot_sync INTEGER DEFAULT 0,
-                    earliest_msg_id INTEGER DEFAULT 0,
-                    earliest_msg_date INTEGER DEFAULT 0
-                );
-            ");
-
-            ExecuteNonQuery(@"
-                CREATE TABLE IF NOT EXISTS channel_hot_messages (
-                    chat_id INTEGER,
-                    message_id INTEGER,
-                    date INTEGER,
-                    max_reaction_count INTEGER,
-                    top_emoji TEXT,
-                    snippet TEXT,
-                    sender_name TEXT,
-                    has_media INTEGER,
-                    is_cold INTEGER DEFAULT 0,
-                    is_deleted INTEGER DEFAULT 0,
-                    reactions_json TEXT,
-                    PRIMARY KEY (chat_id, message_id)
-                );
-            ");
-
-            ExecuteNonQuery(@"
-                CREATE TABLE IF NOT EXISTS reaction_sentiment_config (
-                    emoji TEXT PRIMARY KEY,
-                    category INTEGER
-                );
-            ");
-
-            ExecuteNonQuery(@"
-                CREATE INDEX IF NOT EXISTS idx_hot_rank 
-                ON channel_hot_messages(chat_id, is_deleted, max_reaction_count DESC);
-            ");
-
-            ExecuteNonQuery(@"
-                CREATE INDEX IF NOT EXISTS idx_hot_date 
-                ON channel_hot_messages(chat_id, is_deleted, date DESC);
-            ");
+            Initialize();
         }
+
+        public bool IsIndexed(long chatId) => _revisions.ContainsKey(chatId);
+        public long GetRevision(long chatId) => _revisions.TryGetValue(chatId, out var revision) ? revision : 0;
 
         public ChannelSyncState GetSyncState(long chatId)
         {
             lock (_lock)
             {
-                EnsureInitialized();
-                if (_db == null)
+                Initialize();
+                using var stmt = Prepare(@"SELECT newest_synced_msg_id, oldest_synced_msg_id,
+                    cold_sync_completed, sample_count, sample_sum, computed_threshold, custom_threshold,
+                    last_hot_sync, earliest_msg_id, earliest_msg_date, pending_sync_from_id,
+                    pending_sync_newest_id, pending_sync_stop_id, indexed_threshold
+                    FROM channel_sync_state WHERE chat_id = ?;");
+                raw.sqlite3_bind_int64(stmt, 1, chatId);
+                if (Step(stmt) != raw.SQLITE_ROW) return new ChannelSyncState { ChatId = chatId };
+                return new ChannelSyncState
                 {
-                    return new ChannelSyncState { ChatId = chatId };
-                }
-
-                const string sql = @"
-                    SELECT chat_id, newest_synced_msg_id, oldest_synced_msg_id, 
-                           cold_sync_completed, sample_count, sample_sum, 
-                           computed_threshold, custom_threshold, last_hot_sync,
-                           earliest_msg_id, earliest_msg_date
-                    FROM channel_sync_state WHERE chat_id = ?;
-                ";
-
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) != raw.SQLITE_OK)
-                    {
-                        return new ChannelSyncState { ChatId = chatId };
-                    }
-
-                    raw.sqlite3_bind_int64(stmt, 1, chatId);
-
-                    if (raw.sqlite3_step(stmt) == raw.SQLITE_ROW)
-                    {
-                        var state = new ChannelSyncState
-                        {
-                            ChatId = raw.sqlite3_column_int64(stmt, 0),
-                            NewestSyncedMsgId = raw.sqlite3_column_int64(stmt, 1),
-                            OldestSyncedMsgId = raw.sqlite3_column_int64(stmt, 2),
-                            ColdSyncCompleted = raw.sqlite3_column_int(stmt, 3) != 0,
-                            SampleCount = raw.sqlite3_column_int(stmt, 4),
-                            SampleSum = raw.sqlite3_column_int(stmt, 5),
-                            ComputedThreshold = Math.Max(1, raw.sqlite3_column_int(stmt, 6)),
-                            CustomThreshold = raw.sqlite3_column_type(stmt, 7) == raw.SQLITE_NULL ? null : raw.sqlite3_column_int(stmt, 7),
-                            LastHotSync = raw.sqlite3_column_int64(stmt, 8),
-                            EarliestMsgId = raw.sqlite3_column_int64(stmt, 9),
-                            EarliestMsgDate = raw.sqlite3_column_int64(stmt, 10)
-                        };
-                        return state;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null)
-                    {
-                        raw.sqlite3_finalize(stmt);
-                    }
-                }
-
-                return new ChannelSyncState { ChatId = chatId };
+                    ChatId = chatId,
+                    NewestSyncedMsgId = raw.sqlite3_column_int64(stmt, 0),
+                    OldestSyncedMsgId = raw.sqlite3_column_int64(stmt, 1),
+                    ColdSyncCompleted = raw.sqlite3_column_int(stmt, 2) != 0,
+                    SampleCount = raw.sqlite3_column_int(stmt, 3),
+                    SampleSum = raw.sqlite3_column_int64(stmt, 4),
+                    ComputedThreshold = Math.Max(1, raw.sqlite3_column_int(stmt, 5)),
+                    CustomThreshold = raw.sqlite3_column_type(stmt, 6) == raw.SQLITE_NULL ? null : raw.sqlite3_column_int(stmt, 6),
+                    LastHotSync = raw.sqlite3_column_int64(stmt, 7),
+                    EarliestMsgId = raw.sqlite3_column_int64(stmt, 8),
+                    EarliestMsgDate = raw.sqlite3_column_int64(stmt, 9),
+                    PendingSyncFromId = raw.sqlite3_column_int64(stmt, 10),
+                    PendingSyncNewestId = raw.sqlite3_column_int64(stmt, 11),
+                    PendingSyncStopId = raw.sqlite3_column_int64(stmt, 12),
+                    IndexedThreshold = Math.Max(1, raw.sqlite3_column_int(stmt, 13))
+                };
             }
         }
 
-        public void SaveSyncState(ChannelSyncState state)
+        // Callers update only their fields on the current row, inside the same transaction as the batch.
+        public ChannelSyncState CommitBatch(long chatId, IReadOnlyList<HotMessageItem> messages,
+            Action<ChannelSyncState> advance, long coldCutoff)
         {
             lock (_lock)
             {
-                EnsureInitialized();
-                if (_db == null || state == null)
+                Initialize();
+                ChannelSyncState state = null;
+                int oldThreshold = 0;
+                var saved = new List<HotMessageItem>();
+                bool pruned = false;
+                RunInTransaction(() =>
                 {
-                    return;
-                }
-
-                const string sql = @"
-                    INSERT OR REPLACE INTO channel_sync_state (
-                        chat_id, newest_synced_msg_id, oldest_synced_msg_id,
-                        cold_sync_completed, sample_count, sample_sum,
-                        computed_threshold, custom_threshold, last_hot_sync,
-                        earliest_msg_id, earliest_msg_date
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                ";
-
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) != raw.SQLITE_OK)
+                    state = GetSyncState(chatId);
+                    oldThreshold = state.EffectiveThreshold;
+                    using var sample = Prepare(@"INSERT OR IGNORE INTO channel_reaction_samples
+                        (chat_id, message_id, reaction_count) SELECT ?, ?, ?
+                        WHERE NOT EXISTS (SELECT 1 FROM channel_hot_messages
+                            WHERE chat_id = ? AND message_id = ? AND is_deleted = 1);");
+                    foreach (var item in messages)
                     {
-                        return;
+                        if (item.MaxReactionCount <= 0 || state.SampleCount >= 50) continue;
+                        raw.sqlite3_bind_int64(sample, 1, chatId);
+                        raw.sqlite3_bind_int64(sample, 2, item.MessageId);
+                        raw.sqlite3_bind_int(sample, 3, item.MaxReactionCount);
+                        raw.sqlite3_bind_int64(sample, 4, chatId);
+                        raw.sqlite3_bind_int64(sample, 5, item.MessageId);
+                        Step(sample);
+                        if (raw.sqlite3_changes(_db) != 0)
+                        {
+                            state.SampleCount++;
+                            state.SampleSum += item.MaxReactionCount;
+                        }
+                        Check(raw.sqlite3_reset(sample));
+                    }
+                    if (state.SampleCount == 50)
+                    {
+                        state.ComputedThreshold = ComputeThreshold(state);
                     }
 
-                    raw.sqlite3_bind_int64(stmt, 1, state.ChatId);
-                    raw.sqlite3_bind_int64(stmt, 2, state.NewestSyncedMsgId);
-                    raw.sqlite3_bind_int64(stmt, 3, state.OldestSyncedMsgId);
-                    raw.sqlite3_bind_int(stmt, 4, state.ColdSyncCompleted ? 1 : 0);
-                    raw.sqlite3_bind_int(stmt, 5, state.SampleCount);
-                    raw.sqlite3_bind_int(stmt, 6, state.SampleSum);
-                    raw.sqlite3_bind_int(stmt, 7, state.ComputedThreshold);
-
-                    if (state.CustomThreshold.HasValue)
+                    advance?.Invoke(state);
+                    if (state.ColdSyncCompleted && state.SampleCount > 0 && state.SampleCount < 50)
                     {
-                        raw.sqlite3_bind_int(stmt, 8, state.CustomThreshold.Value);
+                        state.ComputedThreshold = ComputeThreshold(state);
                     }
-                    else
+                    using var upsert = Prepare(UpsertSql);
+                    foreach (var item in messages)
                     {
-                        raw.sqlite3_bind_null(stmt, 8);
+                        if (item.MaxReactionCount <= 0)
+                        {
+                            if (ClearReactionCount(chatId, item.MessageId)) saved.Add(new HotMessageItem { MessageId = item.MessageId });
+                        }
+                        else if (item.Date < coldCutoff && item.MaxReactionCount < state.EffectiveThreshold)
+                        {
+                            if (DeleteVisibleMessage(chatId, item.MessageId)) saved.Add(new HotMessageItem { MessageId = item.MessageId });
+                        }
+                        else if (WriteMessage(upsert, chatId, item))
+                        {
+                            saved.Add(item);
+                        }
                     }
-
-                    raw.sqlite3_bind_int64(stmt, 9, state.LastHotSync);
-                    raw.sqlite3_bind_int64(stmt, 10, state.EarliestMsgId);
-                    raw.sqlite3_bind_int64(stmt, 11, state.EarliestMsgDate);
-
-                    raw.sqlite3_step(stmt);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null)
+                    if (messages.Any(x => x.Date < coldCutoff))
                     {
-                        raw.sqlite3_finalize(stmt);
+                        state.IndexedThreshold = Math.Max(state.IndexedThreshold, state.EffectiveThreshold);
                     }
-                }
+                    // A metadata checkpoint also prunes rows that have aged out of the hot window.
+                    if (state.EffectiveThreshold != oldThreshold || messages.Count == 0)
+                    {
+                        Prune(chatId, state.EffectiveThreshold, coldCutoff);
+                        pruned = raw.sqlite3_changes(_db) != 0;
+                        state.IndexedThreshold = Math.Max(state.IndexedThreshold, state.EffectiveThreshold);
+                    }
+                    SaveState(state);
+                });
+                _revisions.TryAdd(chatId, 0);
+                UpdateCachedMessages(chatId, saved);
+                if (pruned || state.EffectiveThreshold != oldThreshold) PruneCache(chatId, state.EffectiveThreshold, coldCutoff);
+                if (pruned || saved.Count > 0 || state.EffectiveThreshold != oldThreshold) Changed(chatId);
+                return state;
             }
+        }
+
+        private static int ComputeThreshold(ChannelSyncState state)
+        {
+            return Math.Max(1, (int)Math.Floor((double)state.SampleSum / state.SampleCount * 0.9));
+        }
+
+        private void SaveState(ChannelSyncState state)
+        {
+            using var stmt = Prepare(@"INSERT OR REPLACE INTO channel_sync_state
+                (chat_id, newest_synced_msg_id, oldest_synced_msg_id, cold_sync_completed,
+                 sample_count, sample_sum, computed_threshold, custom_threshold, last_hot_sync,
+                 earliest_msg_id, earliest_msg_date, pending_sync_from_id, pending_sync_newest_id,
+                 pending_sync_stop_id, indexed_threshold) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);");
+            raw.sqlite3_bind_int64(stmt, 1, state.ChatId);
+            raw.sqlite3_bind_int64(stmt, 2, state.NewestSyncedMsgId);
+            raw.sqlite3_bind_int64(stmt, 3, state.OldestSyncedMsgId);
+            raw.sqlite3_bind_int(stmt, 4, state.ColdSyncCompleted ? 1 : 0);
+            raw.sqlite3_bind_int(stmt, 5, state.SampleCount);
+            raw.sqlite3_bind_int64(stmt, 6, state.SampleSum);
+            raw.sqlite3_bind_int(stmt, 7, state.ComputedThreshold);
+            if (state.CustomThreshold.HasValue) raw.sqlite3_bind_int(stmt, 8, state.CustomThreshold.Value);
+            else raw.sqlite3_bind_null(stmt, 8);
+            raw.sqlite3_bind_int64(stmt, 9, state.LastHotSync);
+            raw.sqlite3_bind_int64(stmt, 10, state.EarliestMsgId);
+            raw.sqlite3_bind_int64(stmt, 11, state.EarliestMsgDate);
+            raw.sqlite3_bind_int64(stmt, 12, state.PendingSyncFromId);
+            raw.sqlite3_bind_int64(stmt, 13, state.PendingSyncNewestId);
+            raw.sqlite3_bind_int64(stmt, 14, state.PendingSyncStopId);
+            raw.sqlite3_bind_int(stmt, 15, state.IndexedThreshold);
+            Step(stmt);
+        }
+
+        private const string UpsertSql = @"INSERT OR REPLACE INTO channel_hot_messages
+            (chat_id, message_id, date, max_reaction_count, top_emoji, snippet, sender_name,
+             has_media, is_cold, is_deleted, reactions_json)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?
+            WHERE NOT EXISTS (SELECT 1 FROM channel_hot_messages
+                WHERE chat_id = ? AND message_id = ? AND is_deleted = 1);";
+
+        private bool WriteMessage(sqlite3_stmt stmt, long chatId, HotMessageItem item)
+        {
+            raw.sqlite3_bind_int64(stmt, 1, chatId);
+            raw.sqlite3_bind_int64(stmt, 2, item.MessageId);
+            raw.sqlite3_bind_int64(stmt, 3, item.Date);
+            raw.sqlite3_bind_int(stmt, 4, item.MaxReactionCount);
+            raw.sqlite3_bind_text(stmt, 5, item.TopEmoji ?? string.Empty);
+            raw.sqlite3_bind_text(stmt, 6, item.Snippet ?? string.Empty);
+            raw.sqlite3_bind_text(stmt, 7, item.SenderName ?? string.Empty);
+            raw.sqlite3_bind_int(stmt, 8, item.HasMedia ? 1 : 0);
+            raw.sqlite3_bind_int(stmt, 9, item.IsCold ? 1 : 0);
+            raw.sqlite3_bind_text(stmt, 10, item.ReactionsJson ?? string.Empty);
+            raw.sqlite3_bind_int64(stmt, 11, chatId);
+            raw.sqlite3_bind_int64(stmt, 12, item.MessageId);
+            Step(stmt);
+            var changed = raw.sqlite3_changes(_db) != 0;
+            Check(raw.sqlite3_reset(stmt));
+            return changed;
         }
 
         public void UpsertMessages(long chatId, IEnumerable<HotMessageItem> messages)
         {
             lock (_lock)
             {
-                EnsureInitialized();
-                if (_db == null || messages == null)
+                Initialize();
+                var saved = new List<HotMessageItem>();
+                RunInTransaction(() =>
                 {
-                    return;
-                }
-
-                ExecuteNonQuery("BEGIN TRANSACTION;");
-
-                const string sql = @"
-                    INSERT OR REPLACE INTO channel_hot_messages (
-                        chat_id, message_id, date, max_reaction_count, top_emoji,
-                        snippet, sender_name, has_media, is_cold, is_deleted, reactions_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);
-                ";
-
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
+                    using var stmt = Prepare(UpsertSql);
+                    foreach (var item in messages)
                     {
-                        foreach (var msg in messages)
-                        {
-                            raw.sqlite3_bind_int64(stmt, 1, chatId);
-                            raw.sqlite3_bind_int64(stmt, 2, msg.MessageId);
-                            raw.sqlite3_bind_int64(stmt, 3, msg.Date);
-                            raw.sqlite3_bind_int(stmt, 4, msg.MaxReactionCount);
-                            raw.sqlite3_bind_text(stmt, 5, msg.TopEmoji ?? "👍");
-                            raw.sqlite3_bind_text(stmt, 6, msg.Snippet ?? string.Empty);
-                            raw.sqlite3_bind_text(stmt, 7, msg.SenderName ?? string.Empty);
-                            raw.sqlite3_bind_int(stmt, 8, msg.HasMedia ? 1 : 0);
-                            raw.sqlite3_bind_int(stmt, 9, msg.IsCold ? 1 : 0);
-                            raw.sqlite3_bind_text(stmt, 10, msg.ReactionsJson ?? string.Empty);
-
-                            raw.sqlite3_step(stmt);
-                            raw.sqlite3_reset(stmt);
-                        }
+                        if (WriteMessage(stmt, chatId, item)) saved.Add(item);
                     }
-
-                    ExecuteNonQuery("COMMIT;");
-                }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                    ExecuteNonQuery("ROLLBACK;");
-                }
-                finally
-                {
-                    if (stmt != null)
-                    {
-                        raw.sqlite3_finalize(stmt);
-                    }
-                }
+                });
+                UpdateCachedMessages(chatId, saved);
+                if (saved.Count > 0) Changed(chatId);
             }
         }
 
-        public void PruneColdMessages(long chatId, int threshold, long olderThanDate)
+        public bool RequiresRescan(long chatId, int? threshold)
+        {
+            var state = GetSyncState(chatId);
+            return (threshold ?? state.ComputedThreshold) < state.IndexedThreshold;
+        }
+
+        public bool SetCustomThreshold(long chatId, int? threshold, bool rescanConfirmed = false)
+        {
+            if (threshold < 1) throw new ArgumentOutOfRangeException(nameof(threshold));
+            lock (_lock)
+            {
+                Initialize();
+                ChannelSyncState state = null;
+                bool applied = false;
+                var cutoff = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 7 * 86400;
+                RunInTransaction(() =>
+                {
+                    state = GetSyncState(chatId);
+                    if (!rescanConfirmed && (threshold ?? state.ComputedThreshold) < state.IndexedThreshold) return;
+                    applied = true;
+                    state.CustomThreshold = threshold;
+                    Prune(chatId, state.EffectiveThreshold, cutoff);
+                    state.IndexedThreshold = Math.Max(state.IndexedThreshold, state.EffectiveThreshold);
+                    SaveState(state);
+                });
+                if (!applied) return false;
+                PruneCache(chatId, state.EffectiveThreshold, cutoff);
+                Changed(chatId);
+                return true;
+            }
+        }
+
+        private void Prune(long chatId, int threshold, long cutoff)
+        {
+            using var stmt = Prepare(@"DELETE FROM channel_hot_messages
+                WHERE chat_id = ? AND is_deleted = 0 AND date < ? AND max_reaction_count < ?;");
+            raw.sqlite3_bind_int64(stmt, 1, chatId);
+            raw.sqlite3_bind_int64(stmt, 2, cutoff);
+            raw.sqlite3_bind_int(stmt, 3, threshold);
+            Step(stmt);
+        }
+
+        private bool ClearReactionCount(long chatId, long messageId)
+        {
+            using var stmt = Prepare(@"UPDATE channel_hot_messages SET max_reaction_count = 0,
+                top_emoji = '', reactions_json = '' WHERE chat_id = ? AND message_id = ?
+                AND is_deleted = 0 AND max_reaction_count > 0;");
+            raw.sqlite3_bind_int64(stmt, 1, chatId);
+            raw.sqlite3_bind_int64(stmt, 2, messageId);
+            Step(stmt);
+            return raw.sqlite3_changes(_db) != 0;
+        }
+
+        private bool DeleteVisibleMessage(long chatId, long messageId)
+        {
+            using var stmt = Prepare("DELETE FROM channel_hot_messages WHERE chat_id = ? AND message_id = ? AND is_deleted = 0;");
+            raw.sqlite3_bind_int64(stmt, 1, chatId);
+            raw.sqlite3_bind_int64(stmt, 2, messageId);
+            Step(stmt);
+            return raw.sqlite3_changes(_db) != 0;
+        }
+
+        public List<HotMessageItem> GetTopMessages(long chatId, int limit = 0, long? minDate = null,
+            int minReactions = 1, HotRankMode mode = HotRankMode.All, CancellationToken token = default)
         {
             lock (_lock)
             {
-                EnsureInitialized();
-                if (_db == null)
+                Initialize();
+                token.ThrowIfCancellationRequested();
+                EnsureMessageCache(chatId, token);
+                var version = Sentiments.Version;
+                if (_cachedRanking == null || _cachedMode != mode || _cachedThreshold != minReactions
+                    || _cachedMinDate != minDate || _cachedSentimentVersion != version)
                 {
-                    return;
-                }
-
-                const string sql = @"
-                    DELETE FROM channel_hot_messages 
-                    WHERE chat_id = ? AND date < ? AND max_reaction_count < ?;
-                ";
-
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
+                    var scored = new List<HotMessageItem>();
+                    foreach (var item in _cachedMessages.Values)
                     {
+                        token.ThrowIfCancellationRequested();
+                        if (item.MaxReactionCount < minReactions || (minDate.HasValue && item.Date < minDate)) continue;
+                        var display = item.GetDisplay(mode, Sentiments);
+                        if (display == null || display.DisplayScore < minReactions) continue;
+                        scored.Add(display);
+                    }
+                    token.ThrowIfCancellationRequested();
+                    scored.Sort((a, b) =>
+                    {
+                        var result = b.DisplayScore.CompareTo(a.DisplayScore);
+                        if (result == 0) result = b.Date.CompareTo(a.Date);
+                        return result != 0 ? result : b.MessageId.CompareTo(a.MessageId);
+                    });
+                    _cachedRanking = scored;
+                    _cachedMode = mode;
+                    _cachedThreshold = minReactions;
+                    _cachedMinDate = minDate;
+                    _cachedSentimentVersion = version;
+                }
+                return limit > 0 ? _cachedRanking.Take(limit).ToList() : new List<HotMessageItem>(_cachedRanking);
+            }
+        }
+
+        private void EnsureMessageCache(long chatId, CancellationToken token)
+        {
+            if (_cachedChatId == chatId && _cachedMessages != null) return;
+            var items = new Dictionary<long, HotMessageItem>();
+            using var stmt = Prepare(@"SELECT message_id, date, max_reaction_count, top_emoji,
+                snippet, sender_name, has_media, is_cold, reactions_json FROM channel_hot_messages
+                WHERE chat_id = ? AND is_deleted = 0 AND max_reaction_count > 0;");
+            raw.sqlite3_bind_int64(stmt, 1, chatId);
+            while (Step(stmt) == raw.SQLITE_ROW)
+            {
+                token.ThrowIfCancellationRequested();
+                var item = new HotMessageItem
+                {
+                    ChatId = chatId,
+                    MessageId = raw.sqlite3_column_int64(stmt, 0),
+                    Date = raw.sqlite3_column_int64(stmt, 1),
+                    MaxReactionCount = raw.sqlite3_column_int(stmt, 2),
+                    TopEmoji = ReadText(stmt, 3),
+                    Snippet = ReadText(stmt, 4),
+                    SenderName = ReadText(stmt, 5),
+                    HasMedia = raw.sqlite3_column_int(stmt, 6) != 0,
+                    IsCold = raw.sqlite3_column_int(stmt, 7) != 0,
+                    ReactionsJson = ReadText(stmt, 8)
+                };
+                items.Add(item.MessageId, item);
+            }
+            _cachedChatId = chatId;
+            _cachedMessages = items;
+            _cachedRanking = null;
+        }
+
+        private void UpdateCachedMessages(long chatId, IEnumerable<HotMessageItem> items)
+        {
+            if (_cachedChatId != chatId || _cachedMessages == null) return;
+            foreach (var item in items)
+            {
+                if (item.MaxReactionCount <= 0) _cachedMessages.Remove(item.MessageId);
+                else _cachedMessages[item.MessageId] = item;
+            }
+            _cachedRanking = null;
+        }
+
+        private void PruneCache(long chatId, int threshold, long cutoff)
+        {
+            if (_cachedChatId != chatId || _cachedMessages == null) return;
+            foreach (var key in _cachedMessages.Where(x => x.Value.Date < cutoff && x.Value.MaxReactionCount < threshold).Select(x => x.Key).ToArray())
+            {
+                _cachedMessages.Remove(key);
+            }
+            _cachedRanking = null;
+        }
+
+        public void ApplyUpdates(long chatId, IReadOnlyList<long> deleted,
+            IReadOnlyList<(long MessageId, int Count, string Emoji, string Json)> reactions)
+        {
+            lock (_lock)
+            {
+                Initialize();
+                var changed = new List<long>();
+                RunInTransaction(() =>
+                {
+                    foreach (var messageId in deleted)
+                    {
+                        using var stmt = Prepare(@"INSERT OR REPLACE INTO channel_hot_messages
+                            (chat_id, message_id, is_deleted) VALUES (?, ?, 1);");
                         raw.sqlite3_bind_int64(stmt, 1, chatId);
-                        raw.sqlite3_bind_int64(stmt, 2, olderThanDate);
-                        raw.sqlite3_bind_int(stmt, 3, threshold);
-                        raw.sqlite3_step(stmt);
+                        raw.sqlite3_bind_int64(stmt, 2, messageId);
+                        Step(stmt);
+                        changed.Add(messageId);
                     }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null)
+                    foreach (var item in reactions)
                     {
-                        raw.sqlite3_finalize(stmt);
-                    }
-                }
-            }
-        }
-
-        public void FreezeMessagesOlderThan(long chatId, long olderThanDate)
-        {
-            lock (_lock)
-            {
-                EnsureInitialized();
-                if (_db == null)
-                {
-                    return;
-                }
-
-                const string sql = @"
-                    UPDATE channel_hot_messages 
-                    SET is_cold = 1 
-                    WHERE chat_id = ? AND date < ? AND is_cold = 0;
-                ";
-
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                    {
-                        raw.sqlite3_bind_int64(stmt, 1, chatId);
-                        raw.sqlite3_bind_int64(stmt, 2, olderThanDate);
-                        raw.sqlite3_step(stmt);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null)
-                    {
-                        raw.sqlite3_finalize(stmt);
-                    }
-                }
-            }
-        }
-
-        public List<HotMessageItem> GetTopMessages(long chatId, int limit = 0, long? minDate = null, int minReactions = 1, HotRankMode mode = HotRankMode.All)
-        {
-            var list = new List<HotMessageItem>();
-            lock (_lock)
-            {
-                EnsureInitialized();
-                if (_db == null)
-                {
-                    return list;
-                }
-
-                // limit <= 0 时不加 SQL LIMIT，全量查出满足门槛的所有消息；若有 limit 且为 All 模式，直接在 SQL 限制
-                bool hasLimit = limit > 0 && mode == HotRankMode.All;
-                string limitClause = hasLimit ? " LIMIT ?" : string.Empty;
-
-                var sql = minDate.HasValue
-                    ? $@"SELECT chat_id, message_id, date, max_reaction_count, top_emoji, snippet, sender_name, has_media, is_cold, reactions_json
-                        FROM channel_hot_messages 
-                        WHERE chat_id = ? AND is_deleted = 0 AND max_reaction_count >= ? AND date >= ?
-                        ORDER BY max_reaction_count DESC, date DESC{limitClause};"
-                    : $@"SELECT chat_id, message_id, date, max_reaction_count, top_emoji, snippet, sender_name, has_media, is_cold, reactions_json
-                        FROM channel_hot_messages 
-                        WHERE chat_id = ? AND is_deleted = 0 AND max_reaction_count >= ?
-                        ORDER BY max_reaction_count DESC, date DESC{limitClause};";
-
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                    {
-                        raw.sqlite3_bind_int64(stmt, 1, chatId);
-                        raw.sqlite3_bind_int(stmt, 2, minReactions);
-
-                        int paramIdx = 3;
-                        if (minDate.HasValue)
-                        {
-                            raw.sqlite3_bind_int64(stmt, paramIdx++, minDate.Value);
-                        }
-                        if (hasLimit)
-                        {
-                            raw.sqlite3_bind_int(stmt, paramIdx++, limit);
-                        }
-
-                        while (raw.sqlite3_step(stmt) == raw.SQLITE_ROW)
-                        {
-                            list.Add(new HotMessageItem
-                            {
-                                ChatId = raw.sqlite3_column_int64(stmt, 0),
-                                MessageId = raw.sqlite3_column_int64(stmt, 1),
-                                Date = raw.sqlite3_column_int64(stmt, 2),
-                                MaxReactionCount = raw.sqlite3_column_int(stmt, 3),
-                                TopEmoji = raw.sqlite3_column_text(stmt, 4).utf8_to_string(),
-                                Snippet = raw.sqlite3_column_text(stmt, 5).utf8_to_string(),
-                                SenderName = raw.sqlite3_column_text(stmt, 6).utf8_to_string(),
-                                HasMedia = raw.sqlite3_column_int(stmt, 7) != 0,
-                                IsCold = raw.sqlite3_column_int(stmt, 8) != 0,
-                                ReactionsJson = raw.sqlite3_column_type(stmt, 9) == raw.SQLITE_NULL ? null : raw.sqlite3_column_text(stmt, 9).utf8_to_string()
-                            });
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null)
-                    {
-                        raw.sqlite3_finalize(stmt);
-                    }
-                }
-            }
-
-            if (mode == HotRankMode.All)
-            {
-                foreach (var item in list)
-                {
-                    var (score, badge, sub) = ReactionSentimentService.Current.EvaluateMessage(item, mode);
-                    item.DisplayScore = score;
-                    item.DisplayBadge = badge;
-                    item.SubDetailText = sub;
-                }
-                return limit > 0 ? list.Take(limit).ToList() : list;
-            }
-
-            var evaluated = new List<HotMessageItem>();
-            foreach (var item in list)
-            {
-                var (score, badge, sub) = ReactionSentimentService.Current.EvaluateMessage(item, mode);
-                if (score >= minReactions && score > 0)
-                {
-                    item.DisplayScore = score;
-                    item.DisplayBadge = badge;
-                    item.SubDetailText = sub;
-                    evaluated.Add(item);
-                }
-            }
-
-            var ordered = evaluated
-                .OrderByDescending(x => x.DisplayScore)
-                .ThenByDescending(x => x.Date);
-
-            return limit > 0 ? ordered.Take(limit).ToList() : ordered.ToList();
-        }
-
-        public void UpdateMessageReactionIfExists(long chatId, long messageId, int count, string emoji, string reactionsJson)
-        {
-            lock (_lock)
-            {
-                EnsureInitialized();
-                if (_db == null) return;
-
-                const string sql = @"
-                    UPDATE channel_hot_messages 
-                    SET max_reaction_count = ?, top_emoji = ?, reactions_json = ?
-                    WHERE chat_id = ? AND message_id = ?;";
-
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                    {
-                        raw.sqlite3_bind_int(stmt, 1, count);
-                        raw.sqlite3_bind_text(stmt, 2, emoji ?? "👍");
-                        raw.sqlite3_bind_text(stmt, 3, reactionsJson ?? string.Empty);
+                        using var stmt = Prepare(@"UPDATE channel_hot_messages
+                            SET max_reaction_count = ?, top_emoji = ?, reactions_json = ?
+                            WHERE chat_id = ? AND message_id = ? AND is_deleted = 0
+                            AND (max_reaction_count != ? OR COALESCE(top_emoji, '') != ? OR COALESCE(reactions_json, '') != ?);");
+                        raw.sqlite3_bind_int(stmt, 1, item.Count);
+                        raw.sqlite3_bind_text(stmt, 2, item.Emoji ?? string.Empty);
+                        raw.sqlite3_bind_text(stmt, 3, item.Json ?? string.Empty);
                         raw.sqlite3_bind_int64(stmt, 4, chatId);
-                        raw.sqlite3_bind_int64(stmt, 5, messageId);
-                        raw.sqlite3_step(stmt);
+                        raw.sqlite3_bind_int64(stmt, 5, item.MessageId);
+                        raw.sqlite3_bind_int(stmt, 6, item.Count);
+                        raw.sqlite3_bind_text(stmt, 7, item.Emoji ?? string.Empty);
+                        raw.sqlite3_bind_text(stmt, 8, item.Json ?? string.Empty);
+                        Step(stmt);
+                        if (raw.sqlite3_changes(_db) != 0) changed.Add(item.MessageId);
                     }
-                }
-                catch (Exception ex)
+                });
+                if (_cachedChatId == chatId && _cachedMessages != null)
                 {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null) raw.sqlite3_finalize(stmt);
-                }
-            }
-        }
-
-        private Dictionary<string, SentimentCategory> InternalGetSentimentConfigs()
-        {
-            var dict = new Dictionary<string, SentimentCategory>(StringComparer.Ordinal);
-            if (_db == null) return dict;
-
-            const string sql = "SELECT emoji, category FROM reaction_sentiment_config;";
-            sqlite3_stmt stmt = null;
-            try
-            {
-                if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                {
-                    while (raw.sqlite3_step(stmt) == raw.SQLITE_ROW)
+                    foreach (var messageId in deleted) _cachedMessages.Remove(messageId);
+                    foreach (var item in reactions)
                     {
-                        var emoji = raw.sqlite3_column_text(stmt, 0).utf8_to_string();
-                        var cat = (SentimentCategory)raw.sqlite3_column_int(stmt, 1);
-                        if (!string.IsNullOrEmpty(emoji))
+                        if (!_cachedMessages.TryGetValue(item.MessageId, out var cached))
                         {
-                            dict[emoji] = cat;
+                            if (item.Count > 0 && changed.Contains(item.MessageId)) _cachedMessages = null;
+                            if (_cachedMessages == null) break;
+                            continue;
+                        }
+                        if (item.Count <= 0) _cachedMessages.Remove(item.MessageId);
+                        else
+                        {
+                            cached.MaxReactionCount = item.Count;
+                            cached.TopEmoji = item.Emoji;
+                            cached.ReactionsJson = item.Json;
                         }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                Logger.Exception(ex);
-            }
-            finally
-            {
-                if (stmt != null) raw.sqlite3_finalize(stmt);
-            }
-            return dict;
-        }
-
-        public Dictionary<string, SentimentCategory> GetSentimentConfigs()
-        {
-            lock (_lock)
-            {
-                EnsureInitialized();
-                return InternalGetSentimentConfigs();
-            }
-        }
-
-        public void SaveSentimentConfig(string emoji, SentimentCategory? category)
-        {
-            lock (_lock)
-            {
-                EnsureInitialized();
-                if (_db == null || string.IsNullOrEmpty(emoji)) return;
-
-                if (category.HasValue)
-                {
-                    const string sql = "INSERT OR REPLACE INTO reaction_sentiment_config (emoji, category) VALUES (?, ?);";
-                    sqlite3_stmt stmt = null;
-                    try
-                    {
-                        if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                        {
-                            raw.sqlite3_bind_text(stmt, 1, emoji);
-                            raw.sqlite3_bind_int(stmt, 2, (int)category.Value);
-                            raw.sqlite3_step(stmt);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Exception(ex);
-                    }
-                    finally
-                    {
-                        if (stmt != null) raw.sqlite3_finalize(stmt);
-                    }
-                }
-                else
-                {
-                    const string sql = "DELETE FROM reaction_sentiment_config WHERE emoji = ?;";
-                    sqlite3_stmt stmt = null;
-                    try
-                    {
-                        if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                        {
-                            raw.sqlite3_bind_text(stmt, 1, emoji);
-                            raw.sqlite3_step(stmt);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Exception(ex);
-                    }
-                    finally
-                    {
-                        if (stmt != null) raw.sqlite3_finalize(stmt);
-                    }
-                }
-            }
-        }
-
-        public void ClearSentimentConfigs()
-        {
-            lock (_lock)
-            {
-                EnsureInitialized();
-                if (_db == null) return;
-                ExecuteNonQuery("DELETE FROM reaction_sentiment_config;");
+                if (changed.Count > 0) Changed(chatId);
             }
         }
 
@@ -672,38 +558,11 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
-                EnsureInitialized();
-                if (_db == null)
-                {
-                    return 0;
-                }
-
-                const string sql = "SELECT COUNT(*) FROM channel_hot_messages WHERE chat_id = ? AND is_deleted = 0;";
-                sqlite3_stmt stmt = null;
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                    {
-                        raw.sqlite3_bind_int64(stmt, 1, chatId);
-                        if (raw.sqlite3_step(stmt) == raw.SQLITE_ROW)
-                        {
-                            return raw.sqlite3_column_int(stmt, 0);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null)
-                    {
-                        raw.sqlite3_finalize(stmt);
-                    }
-                }
-
-                return 0;
+                Initialize();
+                using var stmt = Prepare("SELECT COUNT(*) FROM channel_hot_messages WHERE chat_id = ? AND is_deleted = 0 AND max_reaction_count > 0;");
+                raw.sqlite3_bind_int64(stmt, 1, chatId);
+                Step(stmt);
+                return raw.sqlite3_column_int(stmt, 0);
             }
         }
 
@@ -711,112 +570,154 @@ namespace Telegram.Services.HotReactions
         {
             lock (_lock)
             {
-                EnsureInitialized();
-                if (_db == null)
+                Initialize();
+                RunInTransaction(() =>
                 {
-                    return;
-                }
-
-                const string sql1 = "DELETE FROM channel_sync_state WHERE chat_id = ?;";
-                const string sql2 = "DELETE FROM channel_hot_messages WHERE chat_id = ?;";
-
-                sqlite3_stmt stmt = null;
-                try
+                    var state = new ChannelSyncState { ChatId = chatId, CustomThreshold = GetSyncState(chatId).CustomThreshold };
+                    using var messages = Prepare("DELETE FROM channel_hot_messages WHERE chat_id = ? AND is_deleted = 0;");
+                    raw.sqlite3_bind_int64(messages, 1, chatId);
+                    Step(messages);
+                    using var samples = Prepare("DELETE FROM channel_reaction_samples WHERE chat_id = ?;");
+                    raw.sqlite3_bind_int64(samples, 1, chatId);
+                    Step(samples);
+                    SaveState(state);
+                });
+                if (_cachedChatId == chatId)
                 {
-                    if (raw.sqlite3_prepare_v2(_db, sql1, out stmt) == raw.SQLITE_OK)
-                    {
-                        raw.sqlite3_bind_int64(stmt, 1, chatId);
-                        raw.sqlite3_step(stmt);
-                    }
+                    _cachedMessages?.Clear();
                 }
-                finally
-                {
-                    if (stmt != null) raw.sqlite3_finalize(stmt);
-                    stmt = null;
-                }
-
-                try
-                {
-                    if (raw.sqlite3_prepare_v2(_db, sql2, out stmt) == raw.SQLITE_OK)
-                    {
-                        raw.sqlite3_bind_int64(stmt, 1, chatId);
-                        raw.sqlite3_step(stmt);
-                    }
-                }
-                finally
-                {
-                    if (stmt != null) raw.sqlite3_finalize(stmt);
-                }
+                Changed(chatId);
             }
         }
 
-        public void MarkMessageDeleted(long chatId, long messageId)
+        public Dictionary<string, SentimentCategory> GetSentimentConfigs()
         {
             lock (_lock)
             {
-                EnsureInitialized();
-                if (_db == null)
-                {
-                    return;
-                }
+                Initialize();
+                return ReadSentimentConfigs();
+            }
+        }
 
-                const string sql = "UPDATE channel_hot_messages SET is_deleted = 1 WHERE chat_id = ? AND message_id = ?;";
-                sqlite3_stmt stmt = null;
-                try
+        private Dictionary<string, SentimentCategory> ReadSentimentConfigs()
+        {
+            var result = new Dictionary<string, SentimentCategory>(StringComparer.Ordinal);
+            using var stmt = Prepare("SELECT emoji, category FROM reaction_sentiment_config;");
+            while (Step(stmt) == raw.SQLITE_ROW)
+            {
+                result[ReadText(stmt, 0)] = (SentimentCategory)raw.sqlite3_column_int(stmt, 1);
+            }
+            return result;
+        }
+
+        public void SaveSentimentConfig(string emoji, SentimentCategory? category)
+        {
+            lock (_lock)
+            {
+                Initialize();
+                using var stmt = Prepare(category.HasValue
+                    ? "INSERT OR REPLACE INTO reaction_sentiment_config (emoji, category) VALUES (?, ?);"
+                    : "DELETE FROM reaction_sentiment_config WHERE emoji = ?;");
+                raw.sqlite3_bind_text(stmt, 1, emoji);
+                if (category.HasValue) raw.sqlite3_bind_int(stmt, 2, (int)category.Value);
+                Step(stmt);
+                Sentiments.SetCustomCategory(emoji, category);
+                _cachedRanking = null;
+            }
+        }
+
+        public void ClearSentimentConfigs()
+        {
+            lock (_lock)
+            {
+                Initialize();
+                ExecuteNonQuery("DELETE FROM reaction_sentiment_config;");
+                Sentiments.ResetToDefaults();
+                _cachedRanking = null;
+            }
+        }
+
+        private void Changed(long chatId)
+        {
+            _revisions.AddOrUpdate(chatId, 1, (_, revision) => revision + 1);
+            if (_cachedChatId == chatId) _cachedRanking = null;
+        }
+
+        private void EnsureColumn(string table, string column, string declaration)
+        {
+            using (var stmt = Prepare($"PRAGMA table_info({table});"))
+            {
+                while (Step(stmt) == raw.SQLITE_ROW)
                 {
-                    if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                    {
-                        raw.sqlite3_bind_int64(stmt, 1, chatId);
-                        raw.sqlite3_bind_int64(stmt, 2, messageId);
-                        raw.sqlite3_step(stmt);
-                    }
+                    if (ReadText(stmt, 1) == column) return;
                 }
-                catch (Exception ex)
-                {
-                    Logger.Exception(ex);
-                }
-                finally
-                {
-                    if (stmt != null)
-                    {
-                        raw.sqlite3_finalize(stmt);
-                    }
-                }
+            }
+            ExecuteNonQuery($"ALTER TABLE {table} ADD COLUMN {column} {declaration};");
+        }
+
+        private sqlite3_stmt Prepare(string sql)
+        {
+            var result = raw.sqlite3_prepare_v2(_db, sql, out var stmt);
+            if (result != raw.SQLITE_OK) stmt?.Dispose();
+            Check(result);
+            return stmt;
+        }
+
+        private int Step(sqlite3_stmt stmt)
+        {
+            var result = raw.sqlite3_step(stmt);
+            Check(result);
+            return result;
+        }
+
+        private void Check(int result)
+        {
+            if (result != raw.SQLITE_OK && result != raw.SQLITE_ROW && result != raw.SQLITE_DONE)
+            {
+                throw new InvalidOperationException($"Hot reactions SQLite error ({result}): {raw.sqlite3_errmsg(_db).utf8_to_string()}");
             }
         }
 
         private void ExecuteNonQuery(string sql)
         {
-            if (_db == null)
-            {
-                return;
-            }
+            using var stmt = Prepare(sql);
+            Step(stmt);
+        }
 
-            sqlite3_stmt stmt = null;
+        private void RunInTransaction(Action action)
+        {
+            ExecuteNonQuery("BEGIN IMMEDIATE;");
             try
             {
-                if (raw.sqlite3_prepare_v2(_db, sql, out stmt) == raw.SQLITE_OK)
-                {
-                    raw.sqlite3_step(stmt);
-                }
+                action();
+                ExecuteNonQuery("COMMIT;");
             }
-            catch (Exception ex)
+            catch
             {
-                Logger.Exception(ex);
+                try { ExecuteNonQuery("ROLLBACK;"); }
+                catch (Exception ex) { Logger.Exception(ex); }
+                throw;
             }
-            finally
-            {
-                if (stmt != null)
-                {
-                    raw.sqlite3_finalize(stmt);
-                }
-            }
+        }
+
+        private static string ReadText(sqlite3_stmt stmt, int column)
+        {
+            return raw.sqlite3_column_type(stmt, column) == raw.SQLITE_NULL ? string.Empty : raw.sqlite3_column_text(stmt, column).utf8_to_string();
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(HotReactionsDatabase));
         }
 
         public void Dispose()
         {
             lock (_lock)
             {
+                if (_disposed) return;
+                _disposed = true;
+                _cachedMessages = null;
+                _cachedRanking = null;
                 if (_db != null)
                 {
                     raw.sqlite3_close(_db);

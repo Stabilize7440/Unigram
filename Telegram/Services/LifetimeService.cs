@@ -306,6 +306,7 @@ namespace Telegram.Services
                 }
             });
 
+            await item.ClientService.CloseHotReactionsAsync();
             await Task.Factory.StartNew(() =>
             {
                 try

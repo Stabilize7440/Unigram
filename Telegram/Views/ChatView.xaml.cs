@@ -1464,12 +1464,7 @@ namespace Telegram.Views
 
         private static void HotLog(string msg)
         {
-            try
-            {
-                var dir = Windows.Storage.ApplicationData.Current.LocalFolder.Path;
-                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "hot_debug.log"), $"[{DateTime.Now:HH:mm:ss.fff}] [ChatView] {msg}\r\n");
-            }
-            catch { }
+            System.Diagnostics.Debug.WriteLine($"[HotReactions] {msg}");
         }
 
         private HotReactionsPanel _hotReactionsPanel;

@@ -73,6 +73,8 @@ namespace Telegram.Services
 
         ISession Session { get; }
         int SessionId { get; }
+        Telegram.Services.HotReactions.HotReactionsService HotReactions { get; }
+        Task CloseHotReactionsAsync();
     }
 
     public partial interface ICacheService
@@ -427,6 +429,41 @@ namespace Telegram.Services
 
         private bool _cleanAfterClose;
         private bool _initializeAfterClose;
+        private readonly object _hotReactionsLock = new();
+        private Telegram.Services.HotReactions.HotReactionsService _hotReactions;
+        private Task _hotReactionsShutdown = Task.CompletedTask;
+
+        public Telegram.Services.HotReactions.HotReactionsService HotReactions
+        {
+            get
+            {
+                lock (_hotReactionsLock)
+                {
+                    var userId = Options.MyId;
+                    if (userId <= 0) throw new InvalidOperationException("排行榜需要已登录的账号");
+                    if (_hotReactions != null && _hotReactions.UserId != userId) _ = CloseHotReactionsAsync();
+                    return _hotReactions ??= new Telegram.Services.HotReactions.HotReactionsService(this, _hotReactionsShutdown);
+                }
+            }
+        }
+
+        public Task CloseHotReactionsAsync()
+        {
+            lock (_hotReactionsLock)
+            {
+                if (_hotReactions != null)
+                {
+                    _hotReactionsShutdown = Task.WhenAll(_hotReactionsShutdown, _hotReactions.ShutdownAsync());
+                    _hotReactions = null;
+                }
+                return _hotReactionsShutdown;
+            }
+        }
+
+        private void CloseHotReactions()
+        {
+            _ = CloseHotReactionsAsync();
+        }
 
         private static readonly Thread _runThread;
 
@@ -482,6 +519,7 @@ namespace Telegram.Services
         {
             _initializeAfterClose = restart;
             _cleanAfterClose = false;
+            CloseHotReactions();
             _client.Send(new Close());
         }
 
@@ -489,6 +527,7 @@ namespace Telegram.Services
         {
             _initializeAfterClose = restart;
             _cleanAfterClose = true;
+            CloseHotReactions();
             _client.Send(new Close());
         }
 
@@ -3625,13 +3664,16 @@ namespace Telegram.Services
                     switch (updateAuthorizationState.AuthorizationState)
                     {
                         case AuthorizationStateLoggingOut:
+                            CloseHotReactions();
                             _settings.Clear();
                             break;
                         case AuthorizationStateClosed:
+                            CloseHotReactions();
                             Clear();
                             break;
                         case AuthorizationStateReady:
                             InitializeReady();
+                            _ = HotReactions.InitializeAsync();
                             break;
                     }
 
@@ -4407,6 +4449,10 @@ namespace Telegram.Services
                     UpdateForumTopic(updateNewMessage.Message.ChatId, false, manager => manager.UpdateNewMessage(updateNewMessage.Message));
                     break;
                 case UpdateDeleteMessages updateDeleteMessages:
+                    if (updateDeleteMessages.IsPermanent && !updateDeleteMessages.FromCache)
+                    {
+                        Volatile.Read(ref _hotReactions)?.MarkMessagesDeleted(updateDeleteMessages.ChatId, updateDeleteMessages.MessageIds);
+                    }
                     UpdateChatLastMessage(updateDeleteMessages);
                     UpdateForumTopic(updateDeleteMessages.ChatId, false, manager => manager.UpdateDeleteMessages(updateDeleteMessages.MessageIds, updateDeleteMessages.IsPermanent, updateDeleteMessages.FromCache));
                     break;
@@ -4425,6 +4471,7 @@ namespace Telegram.Services
                     UpdateForumTopic(updateMessageEdited.ChatId, false, manager => manager.UpdateMessageEdited(updateMessageEdited.MessageId, updateMessageEdited.EditDate, updateMessageEdited.ReplyMarkup));
                     break;
                 case UpdateMessageInteractionInfo updateMessageInteractionInfo:
+                    Volatile.Read(ref _hotReactions)?.UpdateMessageReaction(updateMessageInteractionInfo.ChatId, updateMessageInteractionInfo.MessageId, updateMessageInteractionInfo.InteractionInfo);
                     UpdateForumTopic(updateMessageInteractionInfo.ChatId, false, manager => manager.UpdateMessageInteractionInfo(updateMessageInteractionInfo.MessageId, updateMessageInteractionInfo.InteractionInfo));
                     break;
                 case UpdateMessageContentOpened updateMessageContentOpened:
