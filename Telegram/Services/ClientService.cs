@@ -1053,13 +1053,27 @@ namespace Telegram.Services
 
         public void Send(Function function, Action<Object> handler = null)
         {
+            // Local ad blocking: return the proper empty result without calling TDLib.
+            Object blocked = function switch
+            {
+                GetChatSponsoredMessages => new SponsoredMessages(Array.Empty<SponsoredMessage>(), 0),
+                GetVideoMessageAdvertisements => new VideoMessageAdvertisements(Array.Empty<VideoMessageAdvertisement>(), -1, -1),
+                GetSearchSponsoredChats => new SponsoredChats(Array.Empty<SponsoredChat>()),
+                _ => null
+            };
+            if (blocked != null)
+            {
+                handler?.Invoke(blocked);
+                return;
+            }
+
             _client.Send(function, handler);
         }
 
         public Task<Object> SendAsync(Function function)
         {
             var tsc = new TaskCompletionSource<Object>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _client.Send(function, tsc.SetResult);
+            Send(function, tsc.SetResult);
 
             return tsc.Task;
         }

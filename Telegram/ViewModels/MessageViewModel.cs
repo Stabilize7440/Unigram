@@ -112,6 +112,9 @@ namespace Telegram.ViewModels
         /// </summary>
         public MessageAnimationState AnimationState { get; set; }
 
+        // An explicit reveal lasts for this message instance, until its channel rules change.
+        public int ContentFilterExpandedVersion { get; set; } = -1;
+
         public bool IsFirst { get; set; } = true;
         public bool IsLast { get; set; } = true;
 

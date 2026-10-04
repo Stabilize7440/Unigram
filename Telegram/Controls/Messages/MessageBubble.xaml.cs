@@ -21,6 +21,7 @@ using Telegram.Native.Composition;
 using Telegram.Native.Controls;
 using Telegram.Navigation;
 using Telegram.Services;
+using Telegram.Services.Settings;
 using Telegram.Td;
 using Telegram.Td.Api;
 using Telegram.ViewModels;
@@ -86,6 +87,12 @@ namespace Telegram.Controls.Messages
 
         private bool _hasReplyMarkup;
 
+        private Grid NormalContent;
+        private HyperlinkButton FilteredPlaceholder;
+        private ContentFilterSettings _contentFilters;
+
+        public bool IsContentFiltered { get; private set; }
+
         private LayerVisual _layerVisual;
         private bool _corners;
         private float _topLeft;
@@ -97,6 +104,8 @@ namespace Telegram.Controls.Messages
         {
             DefaultStyleKey = typeof(MessageBubble);
             Loading += OnLoading;
+            Loaded += OnContentFilterLoaded;
+            Unloaded += OnContentFilterUnloaded;
 
             Instrumentation.Register(this);
         }
@@ -249,6 +258,9 @@ namespace Telegram.Controls.Messages
 
         protected override void OnApplyTemplate()
         {
+            NormalContent = GetTemplateChild(nameof(NormalContent)) as Grid;
+            FilteredPlaceholder = GetTemplateChild(nameof(FilteredPlaceholder)) as HyperlinkButton;
+            FilteredPlaceholder.Click += RevealFilteredMessage;
             PhotoColumn = GetTemplateChild(nameof(PhotoColumn)) as ColumnDefinition;
             ShadowCaster = GetTemplateChild(nameof(ShadowCaster)) as Rectangle;
             ContentPanel = GetTemplateChild(nameof(ContentPanel)) as Grid;
@@ -302,7 +314,7 @@ namespace Telegram.Controls.Messages
             set => Media.Child = value;
         }
 
-        public void Recycle()
+        private void RecycleContent()
         {
             Message.Clear();
             Footer.UpdateMessage(null);
@@ -322,8 +334,117 @@ namespace Telegram.Controls.Messages
 
             //UnloadObject(ref Reactions);
             //UnloadObject(ref MediaReactions);
+        }
 
+        public void Recycle()
+        {
+            RecycleContent();
             UnregisterEvents();
+            SetContentFilterSubscription(null);
+            IsContentFiltered = false;
+        }
+
+        private void OnContentFilterLoaded(object sender, RoutedEventArgs e)
+        {
+            UpdateMessage(_message);
+        }
+
+        private void OnContentFilterUnloaded(object sender, RoutedEventArgs e)
+        {
+            SetContentFilterSubscription(null);
+        }
+
+        private void SetContentFilterSubscription(ContentFilterSettings settings)
+        {
+            if (ReferenceEquals(settings, _contentFilters))
+            {
+                return;
+            }
+            if (_contentFilters != null)
+            {
+                _contentFilters.Changed -= OnContentFilterChanged;
+            }
+            _contentFilters = settings;
+            if (settings != null)
+            {
+                settings.Changed += OnContentFilterChanged;
+            }
+        }
+
+        private void OnContentFilterChanged(object sender, long chatId)
+        {
+            this.BeginOnUIThread(() =>
+            {
+                if (ReferenceEquals(sender, _contentFilters) && _message?.ChatId == chatId)
+                {
+                    UpdateMessage(_message);
+                }
+            });
+        }
+
+        private void RevealFilteredMessage(object sender, RoutedEventArgs e)
+        {
+            if (_message?.Delegate?.Settings is { } settings)
+            {
+                _message.ContentFilterExpandedVersion = settings.ContentFilters.GetVersion(_message.ChatId);
+                UpdateMessage(_message);
+            }
+        }
+
+        private bool UpdateContentFilter(MessageViewModel message)
+        {
+            if (!_templateApplied)
+            {
+                return false;
+            }
+
+            var filters = message?.Chat?.Type is ChatTypeSupergroup { IsChannel: true }
+                && message.Delegate is { IsDialog: true } delegato ? delegato.Settings.ContentFilters : null;
+            var filtered = false;
+            if (filters != null && message.ContentFilterExpandedVersion != filters.GetVersion(message.ChatId))
+            {
+                var text = message.Content is MessageRichMessage richMessage
+                    ? richMessage.Message.ToPlainText() : message.Content.GetCaption()?.Text;
+                filtered = filters.IsMatch(message.ChatId, text);
+                if (!filtered && message.Content is MessageAlbum album)
+                {
+                    foreach (var child in album.Messages)
+                    {
+                        if (filters.IsMatch(message.ChatId, child.Content.GetCaption()?.Text))
+                        {
+                            filtered = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (filtered && !IsContentFiltered)
+            {
+                IsContentFiltered = true;
+                RecycleContent();
+                Media.Child = null;
+            }
+            IsContentFiltered = filtered;
+            NormalContent.Visibility = filtered ? Visibility.Collapsed : Visibility.Visible;
+            FilteredPlaceholder.Visibility = filtered ? Visibility.Visible : Visibility.Collapsed;
+            SetContentFilterSubscription(IsLoaded ? filters : null);
+            return filtered;
+        }
+
+        private bool SkipFilteredContentUpdate(MessageViewModel message)
+        {
+            var wasFiltered = IsContentFiltered;
+            if (UpdateContentFilter(message))
+            {
+                return true;
+            }
+            if (wasFiltered)
+            {
+                UpdateMessage(message);
+                return true;
+            }
+            return false;
         }
 
         public void UpdateMessage(MessageViewModel message)
@@ -331,6 +452,11 @@ namespace Telegram.Controls.Messages
             _message = message;
 
             if (!_templateApplied)
+            {
+                return;
+            }
+
+            if (UpdateContentFilter(message))
             {
                 return;
             }
@@ -358,6 +484,10 @@ namespace Telegram.Controls.Messages
 
         public string GetAutomationName()
         {
+            if (IsContentFiltered)
+            {
+                return "已过滤消息，点击查看原文";
+            }
             if (_message is not MessageViewModel message)
             {
                 return null;
@@ -1834,6 +1964,10 @@ namespace Telegram.Controls.Messages
 
         public void UpdateMessageContent(MessageViewModel message)
         {
+            if (SkipFilteredContentUpdate(message))
+            {
+                return;
+            }
             if (Parent is MessageSelector selector)
             {
                 selector.UpdateMessageStakeDice(message);
@@ -1846,6 +1980,10 @@ namespace Telegram.Controls.Messages
 
         public void UpdateMessageTextLayout(MessageViewModel message)
         {
+            if (SkipFilteredContentUpdate(message))
+            {
+                return;
+            }
             UpdateMessageContentLayout(message);
             UpdateMessageText(message);
         }
@@ -2753,7 +2891,7 @@ namespace Telegram.Controls.Messages
         private void OnSizeChanged(object sender, SizeChangedEventArgs e)
         {
             var message = _message;
-            if (message == null || _ignoreSizeChanged || e.PreviousSize.Width < 1 || e.PreviousSize.Height < 1)
+            if (message == null || IsContentFiltered || _ignoreSizeChanged || e.PreviousSize.Width < 1 || e.PreviousSize.Height < 1)
             {
                 return;
             }

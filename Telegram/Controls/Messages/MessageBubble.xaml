@@ -15,17 +15,6 @@
             <Setter.Value>
                 <ControlTemplate TargetType="local:MessageBubble">
                     <Grid>
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="Auto" />
-                        </Grid.RowDefinitions>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition x:Name="PhotoColumn"
-                                              Width="Auto" />
-                            <ColumnDefinition />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
                         <VisualStateManager.VisualStateGroups>
                             <VisualStateGroup>
                                 <VisualState x:Name="Normal" />
@@ -147,6 +136,18 @@
                                 </VisualState>
                             </VisualStateGroup>
                         </VisualStateManager.VisualStateGroups>
+                    <Grid x:Name="NormalContent">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition x:Name="PhotoColumn"
+                                              Width="Auto" />
+                            <ColumnDefinition />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
                         <!--
                         Once again we have to work around some bug caused by Grid measure implementation:
                         Setting RowSpan="3" while being on Column="0" (the one we need) causes the Grid to insert
@@ -406,6 +407,17 @@
                                                   Padding="0" />
                         </Border>
 
+                    </Grid>
+                        <HyperlinkButton x:Name="FilteredPlaceholder"
+                                         Visibility="Collapsed"
+                                         Content="已过滤消息 · 点击查看原文"
+                                         HorizontalAlignment="Left"
+                                         MaxWidth="{StaticResource MessageMaxWidth}"
+                                         Background="{ThemeResource MessageServiceBackgroundBrush}"
+                                         Foreground="{ThemeResource MessageServiceForegroundBrush}"
+                                         Padding="12,8"
+                                         CornerRadius="12"
+                                         BorderThickness="0" />
                     </Grid>
                 </ControlTemplate>
             </Setter.Value>

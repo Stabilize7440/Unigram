@@ -23,6 +23,7 @@ namespace Telegram.Services
         RecentEmojiSettings RecentEmoji { get; }
         AutoDownloadSettings AutoDownload { get; set; }
         VideoSettings Video { get; }
+        ContentFilterSettings ContentFilters { get; }
 
         bool HideArchivedChats { get; set; }
         bool IsSecretPreviewsEnabled { get; set; }
@@ -111,6 +112,9 @@ namespace Telegram.Services
         private VideoSettings _video;
         public VideoSettings Video => _video ??= new VideoSettings(_own);
 
+        private ContentFilterSettings _contentFilters;
+        public ContentFilterSettings ContentFilters => _contentFilters ??= new ContentFilterSettings(_own);
+
         private bool? _useTestDC;
         public bool UseTestDC
         {
@@ -161,6 +165,7 @@ namespace Telegram.Services
             _own.DeleteContainer("AutoDownload");
             _own.DeleteContainer("Video");
             _own.DeleteContainer("PinnedMessages");
+            _own.DeleteContainer("ContentFilters");
             _own.DeleteContainer("Emoji");
             _own.Clear();
 
@@ -181,6 +186,7 @@ namespace Telegram.Services
             _hideArchivedChats = null;
             _autoDownload = null;
             _video = null;
+            _contentFilters = null;
 
             // Both point at containers Clear has just deleted.
             _autoDownloadStore = null;

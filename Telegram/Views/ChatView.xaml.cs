@@ -2799,6 +2799,23 @@ namespace Telegram.Views
 
         #region Context menu
 
+        private async void ShowContentFilters()
+        {
+            var viewModel = ViewModel;
+            var chat = viewModel?.Chat;
+            if (chat?.Type is not ChatTypeSupergroup { IsChannel: true })
+            {
+                return;
+            }
+
+            var filters = viewModel.Settings.ContentFilters;
+            var popup = new ChannelContentFilterPopup(filters.Get(chat.Id));
+            if (await viewModel.ShowPopupAsync(popup) == ContentDialogResult.Primary)
+            {
+                filters.Save(chat.Id, popup.Configuration);
+            }
+        }
+
         private void Menu_ContextRequested(object sender, RoutedEventArgs e)
         {
             var flyout = new MenuFlyout();
@@ -2823,6 +2840,10 @@ namespace Telegram.Views
 
             flyout.CreateFlyoutItem(Search, Strings.Search, Icons.Search, VirtualKey.F);
             flyout.CreateFlyoutItem(ToggleHotReactions, "🔥 反应排行榜", Icons.Heart);
+            if (chat.Type is ChatTypeSupergroup { IsChannel: true })
+            {
+                flyout.CreateFlyoutItem(ShowContentFilters, "内容过滤", Icons.Settings);
+            }
 
             if (supergroup != null && !supergroup.IsBroadcastGroup && !supergroup.IsDirectMessagesGroup && ((ViewModel.IsPremium || (supergroupFull?.MyBoostCount > 0) || supergroup.Status is ChatMemberStatusCreator or ChatMemberStatusAdministrator)))
             {
