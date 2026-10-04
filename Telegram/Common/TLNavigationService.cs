@@ -552,7 +552,9 @@ namespace Telegram.Common
                             parameter = chat.Id;
                         }
 
-                        chatPage.ViewModel.NavigatedFrom(null, false);
+                        // A failed navigation may leave the cached page without a view model.
+                        // Still deactivate the view and initialize a fresh model below.
+                        chatPage.ViewModel?.NavigatedFrom(null, false);
 
                         chatPage.Deactivate(false);
                         chatPage.Activate(this);

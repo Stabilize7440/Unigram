@@ -44,9 +44,9 @@ namespace System.Runtime.CompilerServices
             where TKey : class
             where TValue : class
         {
-            if (table.TryGetValue(key, out value))
+            if (table.TryGetValue(key, out TValue existing))
             {
-                return value;
+                return existing;
             }
 
             table.Add(key, value);

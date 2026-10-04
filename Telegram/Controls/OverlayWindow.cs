@@ -203,7 +203,7 @@ namespace Telegram.Controls
 
         public static bool PopupOpened(XamlRoot xamlRoot)
         {
-            if (xamlRoot != null && _instances.TryGetValue(xamlRoot, out OverlayWindow window))
+            if (TryGetWindow(xamlRoot, out OverlayWindow window))
             {
                 window.PopupOpened();
                 return true;
@@ -219,7 +219,7 @@ namespace Telegram.Controls
 
         public static bool PopupClosed(XamlRoot xamlRoot)
         {
-            if (xamlRoot != null && _instances.TryGetValue(xamlRoot, out OverlayWindow window))
+            if (TryGetWindow(xamlRoot, out OverlayWindow window))
             {
                 window.PopupClosed();
                 return true;
@@ -275,9 +275,27 @@ namespace Telegram.Controls
             Closing?.Invoke(this, EventArgs.Empty);
         }
 
+        private static bool TryGetWindow(XamlRoot xamlRoot, out OverlayWindow window)
+        {
+            window = null;
+            if (xamlRoot == null || !_instances.TryGetValue(xamlRoot, out window))
+            {
+                return false;
+            }
+
+            // Discard invalid entries so a failed overlay registration cannot poison navigation.
+            if (window == null)
+            {
+                _instances.Remove(xamlRoot);
+                return false;
+            }
+
+            return true;
+        }
+
         public static void TryHide(XamlRoot xamlRoot, ContentDialogResult result)
         {
-            if (xamlRoot != null && _instances.TryGetValue(xamlRoot, out OverlayWindow window))
+            if (TryGetWindow(xamlRoot, out OverlayWindow window))
             {
                 window.TryHide(result);
             }
